@@ -24,7 +24,10 @@ without losing state.
   injection only and are never written to disk.
 - **Real-time event forwarding** — an outbound gateway exposes the run as SSE (`GET /events`,
   with `Last-Event-ID` resumption), can publish the same adapted stream onto a message bus,
-  and can render it in external formats (native, OpenAI `chat.completion.chunk`).
+  and renders it through a **generalized protocol adapter layer**: a registry of
+  self-contained dialect adapters (`native`, OpenAI `chat.completion.chunk`,
+  `openai-responses`/`codex`), selected per run via a config file and extendable without
+  core changes. See [docs/design/sse-protocol-adapter.md](docs/design/sse-protocol-adapter.md).
 - **HITL approvals over the wire** — the web channel forwards approval requests as SSE frames
   and accepts decisions via `POST /hitl`; a hard crash leaves the approval dangling in the log,
   and the resumed run synthesizes a `TOOL_OUTCOME_UNKNOWN` tool result instead of replaying it.
@@ -60,21 +63,32 @@ solution/
       sdk-channel.js      dsh SDK JSON-RPC driver (stdio)
       web-channel.js      dsh web driver (HTTP + mux WebSocket)
     events/
-      formats.js          outbound event formatters (native / openai-chat)
+      formats.js          outbound event formatter façade (delegates to the registry)
+      protocols/          protocol adapter registry + built-in dialects
+        registry.js         id/alias resolution; external adapters register here
+        native.js           verbatim foreman frames
+        openai-chat.js      OpenAI Chat Completions streaming chunks
+        openai-responses.js OpenAI Responses API events (alias: codex)
       event-bus.js        event bus delivery (memory / http)
     observability/
       trace-shipper.js    async trace shipping with retry + failure isolation
     storage/
       snapshot-sink.js    snapshot storage abstraction (credentials via env)
+    config.js             runner config file loader (protocol / delivery selection)
   plugins/
     resume-adapter.mjs    reroutes persisted sessionIds from agents.create to agents.resume
     telemetry-enrich.mjs  deployment-side telemetry attribute pipeline (rule table)
+  bench/
+    protocol.bench.js     protocol pipeline benchmark (real loopback HTTP, no mocks)
   test/
-    unit.test.js          unit tests (retention, redaction, formats, packs)
+    unit.test.js          unit tests (retention, redaction, formats, packs, bus, sink)
+    protocols.test.js     golden-transcript conformance tests for every adapter
+    gateway-wire.test.js  real-HTTP wire tests for the SSE gateway
     e2e/                  end-to-end scenarios (see below)
     mocks/                mock control plane / model / OTLP collector
   cordis.yml              stdio-channel composition (cloud-owned)
   web-patch.yml           web-channel patch overlay (cloud-owned)
+  ROADMAP.md              implemented boundary, capability boundary, TODOs
 ```
 
 ## Quick start
@@ -84,7 +98,9 @@ repo root), and the `git` binary in PATH.
 
 ```sh
 # from foreman/solution
-pnpm test                 # unit tests
+pnpm test                 # unit + protocol conformance + wire tests
+pnpm run bench            # protocol pipeline benchmark (real loopback HTTP)
+pnpm run bench:quick      # same, smaller workload
 pnpm test:e2e:basic       # cold start + session resume (stdio channel)
 pnpm test:e2e:web         # HITL approvals + crash/dangling-approval recovery (web channel)
 pnpm test:e2e:cloud       # trace shipping, snapshot sink, event bus, format adaptation
@@ -93,6 +109,28 @@ pnpm test:e2e:checkpoint  # 7-round incremental checkpoint chain + retention + r
 
 All tests are keyless: they run against in-process mocks of the model endpoint, the control
 plane, and the OTLP collector.
+
+### Protocol selection via config file
+
+The outbound SSE dialect is a config decision (ADR-0002). Point the runner at a
+`foreman.config.json` (constructor `configPath` option or the `FOREMAN_CONFIG` env var) and
+switch dialects without code changes — a typo'd protocol fails loud, it never silently
+degrades to the native stream:
+
+```json
+{
+  "events": {
+    "protocol": "openai-responses",
+    "delivery": "sse"
+  }
+}
+```
+
+`protocol` accepts any registered id or alias (`native`, `openai-chat`, `openai-responses` /
+`codex`); precedence is constructor options > config file > defaults. New dialects are added
+by registering an adapter module — see the
+[protocol adapter design](docs/design/sse-protocol-adapter.md) and
+[ROADMAP](ROADMAP.md#4-how-to-extend).
 
 ### Driving the runner programmatically
 
@@ -121,8 +159,20 @@ await foreman.publish()              // redact + package + upload + reclaim even
 
 ## Documentation
 
+- [Roadmap](ROADMAP.md) — implemented boundary, capability boundary, and TODOs.
 - [Architecture](docs/architecture.md) — run lifecycle, channels, event flow, secret model.
 - [Checkpoint design](docs/checkpoint-design.md) — change packs, skip-list retention, rebaseline.
+- [SSE protocol adapter design](docs/design/sse-protocol-adapter.md) — adapter contract, data
+  model, registry mechanics.
+- Architecture Decision Records ([docs/adr/](docs/adr/)):
+  - [ADR-0001](docs/adr/0001-generic-sse-protocol-adapter-layer.md) — generic SSE protocol
+    adapter layer.
+  - [ADR-0002](docs/adr/0002-runner-config-file.md) — runner config file and protocol
+    selection.
+  - [ADR-0003](docs/adr/0003-openai-responses-protocol.md) — the `openai-responses`
+    (codex) dialect.
+  - [ADR-0004](docs/adr/0004-hermetic-tests-and-benchmarks.md) — hermetic testing and
+    benchmark strategy.
 
 ## License
 
