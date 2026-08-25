@@ -8,6 +8,7 @@
 import native from './native.js'
 import openaiChat from './openai-chat.js'
 import openaiResponses from './openai-responses.js'
+import anthropicMessages from './anthropic-messages.js'
 
 const byKey = new Map() // id | alias -> definition
 const ordered = [] // definitions in registration order
@@ -56,3 +57,4 @@ export function listProtocols() {
 registerProtocol(native)
 registerProtocol(openaiChat)
 registerProtocol(openaiResponses)
+registerProtocol(anthropicMessages)

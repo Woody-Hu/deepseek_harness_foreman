@@ -2,14 +2,22 @@
 
 Foreman is a cloud sandbox runner for [DeepSeek Harness (dsh)](../../README.md): it turns a
 disposable sandbox into a durable agent execution environment. Every run restores a workspace
-and session from object storage, launches dsh inside the sandbox, forwards events and traces
-to the cloud in real time, intercepts secrets before anything leaves the sandbox, and publishes
-the run's artifacts back to storage — so the system can reclaim the sandbox at any moment
-without losing state.
+and session from object storage, launches the harness inside the sandbox, forwards events and
+traces to the cloud in real time, intercepts secrets before anything leaves the sandbox, and
+publishes the run's artifacts back to storage — so the system can reclaim the sandbox at any
+moment without losing state.
+
+Foreman supports multiple harness backends (DeepSeek Harness stdio/web channels, **Codex
+Harness app-server** via ADR-0005) and multiple outbound event protocols (native,
+OpenAI Chat Completions, OpenAI Responses/Codex, **Anthropic Messages/Claude** via ADR-0006),
+all selected via configuration file with no code changes.
 
 ## Feature highlights
 
-- **Cross-sandbox session resume** — the external session id doubles as the dsh session id.
+- **Multi-harness channels** — drive DeepSeek Harness (stdio JSON-RPC, web apiproxy) or
+  Codex Harness (app-server JSON-RPC over stdio) with the same orchestrator. The channel
+  is selected per run via configuration.
+- **Cross-sandbox session resume** — the external session id doubles as the harness session id.
   Session logs are archived per run and restored on the next `prepare()`, so a new sandbox
   continues the conversation with full history (workspace absolute paths must match — cloud
   sandboxes use fixed mount points).
@@ -26,12 +34,13 @@ without losing state.
   with `Last-Event-ID` resumption), can publish the same adapted stream onto a message bus,
   and renders it through a **generalized protocol adapter layer**: a registry of
   self-contained dialect adapters (`native`, OpenAI `chat.completion.chunk`,
-  `openai-responses`/`codex`), selected per run via a config file and extendable without
-  core changes. See [docs/design/sse-protocol-adapter.md](docs/design/sse-protocol-adapter.md).
+  `openai-responses`/`codex`, `anthropic-messages`/`claude`), selected per run via a config
+  file and extendable without core changes. See
+  [docs/design/sse-protocol-adapter.md](docs/design/sse-protocol-adapter.md).
 - **HITL approvals over the wire** — the web channel forwards approval requests as SSE frames
   and accepts decisions via `POST /hitl`; a hard crash leaves the approval dangling in the log,
   and the resumed run synthesizes a `TOOL_OUTCOME_UNKNOWN` tool result instead of replaying it.
-- **Dual trace paths** — path A: dsh's native OTLP telemetry exported to cloud monitoring;
+- **Dual trace paths** — path A: harness's native OTLP telemetry exported to cloud monitoring;
   path B: foreman's own event-stream forwarding (redacted). An optional async trace shipper
   isolates cloud-monitoring failures with retry and eventual delivery.
 - **Storage abstraction** — a snapshot sink interface (local / object-store) resolves
@@ -39,13 +48,15 @@ without losing state.
 
 ## Channels
 
-| Channel | Transport | Session resume | HITL |
-|---|---|---|---|
-| `stdio` | SDK JSON-RPC over NDJSON stdio | via the bundled resume-adapter plugin | — |
-| `web` | dsh web apiproxy (HTTP + WebSocket) | native (cold persisted sessions) | full support |
+| Channel | Transport | Harness | Session resume | HITL |
+|---|---|---|---|---|
+| `stdio` | SDK JSON-RPC over NDJSON stdio | DeepSeek Harness | via the bundled resume-adapter plugin | — |
+| `web` | dsh web apiproxy (HTTP + WebSocket) | DeepSeek Harness | native (cold persisted sessions) | full support |
+| `codex` | JSON-RPC 2.0-lite over stdio JSONL | Codex Harness app-server | via `thread/resume` | planned |
 
-Both channels share one `Foreman` orchestrator; the composition config (`cordis.yml` /
-`web-patch.yml`) is owned by the cloud and delivered through object storage.
+All channels share one `Foreman` orchestrator; the composition config (`cordis.yml` /
+`web-patch.yml` / `foreman.config.json`) is owned by the cloud and delivered through object
+storage.
 
 ## Repository layout
 
@@ -62,6 +73,7 @@ solution/
     channels/
       sdk-channel.js      dsh SDK JSON-RPC driver (stdio)
       web-channel.js      dsh web driver (HTTP + mux WebSocket)
+      codex-channel.js    Codex Harness app-server driver (JSON-RPC over stdio)
     events/
       formats.js          outbound event formatter façade (delegates to the registry)
       protocols/          protocol adapter registry + built-in dialects
@@ -69,6 +81,7 @@ solution/
         native.js           verbatim foreman frames
         openai-chat.js      OpenAI Chat Completions streaming chunks
         openai-responses.js OpenAI Responses API events (alias: codex)
+        anthropic-messages.js Anthropic Messages API events (alias: claude)
       event-bus.js        event bus delivery (memory / http)
     observability/
       trace-shipper.js    async trace shipping with retry + failure isolation
@@ -84,6 +97,9 @@ solution/
     unit.test.js          unit tests (retention, redaction, formats, packs, bus, sink)
     protocols.test.js     golden-transcript conformance tests for every adapter
     gateway-wire.test.js  real-HTTP wire tests for the SSE gateway
+    inbound-parse.test.js parse-direction conformance tests — proposed
+    channels/             channel integration tests
+      codex-channel.test.js
     e2e/                  end-to-end scenarios (see below)
     mocks/                mock control plane / model / OTLP collector
   cordis.yml              stdio-channel composition (cloud-owned)
@@ -93,8 +109,7 @@ solution/
 
 ## Quick start
 
-Requirements: Node.js >= 22.19, a built dsh repository (`pnpm install && pnpm run build` at the
-repo root), and the `git` binary in PATH.
+Requirements: Node.js >= 22.19, a built harness repository, and the `git` binary in PATH.
 
 ```sh
 # from foreman/solution
@@ -127,10 +142,30 @@ degrades to the native stream:
 ```
 
 `protocol` accepts any registered id or alias (`native`, `openai-chat`, `openai-responses` /
-`codex`); precedence is constructor options > config file > defaults. New dialects are added
-by registering an adapter module — see the
+`codex`, `anthropic-messages` / `claude`); precedence is constructor options > config file >
+defaults. New dialects are added by registering an adapter module — see the
 [protocol adapter design](docs/design/sse-protocol-adapter.md) and
 [ROADMAP](ROADMAP.md#4-how-to-extend).
+
+### Harness channel selection via config file
+
+The inbound harness channel is selected per run via configuration (ADR-0005):
+
+```json
+{
+  "harness": {
+    "channel": "codex",
+    "codex": {
+      "binary": "codex",
+      "model": "gpt-5.1-codex",
+      "approvalPolicy": "never"
+    }
+  }
+}
+```
+
+`harness.channel` accepts `'stdio'` (default, DeepSeek Harness), `'web'` (DeepSeek Harness
+web apiproxy), or `'codex'` (Codex Harness app-server).
 
 ### Driving the runner programmatically
 
@@ -138,9 +173,9 @@ by registering an adapter module — see the
 import { Foreman } from '@deepseek-ai/foreman'
 
 const foreman = new Foreman({
-  repoRoot,                          // dsh repository root
+  repoRoot,                          // harness repository root
   workdir,                           // isolated run directory (fixed path across runs)
-  channel: 'web',                    // or 'stdio'
+  channel: 'web',                    // or 'stdio', 'codex'
   agentId, sessionId,                // object-storage coordinates + session identity
   modelEnv: { DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL },  // env-injected only
   controlPlane: { baseUrl },         // artifact storage + message bus
@@ -150,12 +185,25 @@ const foreman = new Foreman({
 })
 
 await foreman.prepare()              // restore config + workspace + session logs
-await foreman.start()                // launch dsh + open the SSE gateway
+await foreman.start()                // launch harness + open the SSE gateway
 const { reason } = await foreman.prompt('do the task')
 await foreman.shutdown()             // graceful (or foreman.kill() to simulate a crash)
 await foreman.collect()              // final answer, change sets, session logs
 await foreman.publish()              // redact + package + upload + reclaim event
 ```
+
+## Protocol adapters
+
+Foreman ships with a protocol adapter layer (ADR-0001) that transforms internal event
+frames into external wire formats. The registry-based design makes adding new protocols
+a matter of writing a single module.
+
+| Adapter | Id | Aliases | Protocol |
+|---|---|---|---|
+| Native | `native` | — | Verbatim foreman frames (lossless) |
+| OpenAI Chat | `openai-chat` | — | Chat Completions streaming chunks |
+| OpenAI Responses | `openai-responses` | `codex` | Responses API streaming events |
+| Anthropic Messages | `anthropic-messages` | `claude` | Messages API streaming events |
 
 ## Documentation
 
@@ -164,6 +212,10 @@ await foreman.publish()              // redact + package + upload + reclaim even
 - [Checkpoint design](docs/checkpoint-design.md) — change packs, skip-list retention, rebaseline.
 - [SSE protocol adapter design](docs/design/sse-protocol-adapter.md) — adapter contract, data
   model, registry mechanics.
+- [Codex channel design](docs/design/codex-channel.md) — Codex Harness app-server integration
+  (ADR-0005), JSON-RPC lifecycle, frame mapping.
+- [Anthropic Messages design](docs/design/anthropic-messages-protocol.md) — Claude Code
+  protocol adapter (ADR-0006), event mapping, content block model.
 - Architecture Decision Records ([docs/adr/](docs/adr/)):
   - [ADR-0001](docs/adr/0001-generic-sse-protocol-adapter-layer.md) — generic SSE protocol
     adapter layer.
@@ -173,6 +225,14 @@ await foreman.publish()              // redact + package + upload + reclaim even
     (codex) dialect.
   - [ADR-0004](docs/adr/0004-hermetic-tests-and-benchmarks.md) — hermetic testing and
     benchmark strategy.
+  - [ADR-0005](docs/adr/0005-codex-app-server-channel.md) — Codex Harness app-server
+    channel integration.
+  - [ADR-0006](docs/adr/0006-anthropic-messages-protocol.md) — Anthropic Messages
+    (Claude Code) protocol adapter.
+  - [ADR-0007](docs/adr/0007-inbound-protocol-adaptation.md) — inbound protocol adaptation
+    (generalized parse direction).
+  - [ADR-0008](docs/adr/0008-harness-protocol-testing-and-benchmarks.md) — independent
+    testing and benchmark strategy for harness protocols.
 
 ## License
 

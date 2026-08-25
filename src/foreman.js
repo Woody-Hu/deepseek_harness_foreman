@@ -56,6 +56,7 @@ import {
 import { deleteArtifact, downloadArtifact, publishBusEvent, uploadArtifact } from './control-plane.js'
 import { SdkChannel } from './channels/sdk-channel.js'
 import { WebChannel } from './channels/web-channel.js'
+import { CodexChannel } from './channels/codex-channel.js'
 import { createEventFormatter, renderSseLine } from './events/formats.js'
 import { loadForemanConfig, resolveConfigPath } from './config.js'
 import { TraceShipper } from './observability/trace-shipper.js'
@@ -243,8 +244,11 @@ export class Foreman {
 
   get workspaceDir() { return join(this.options.workdir, 'workspace') }
   get isWeb() { return this.options.channel === 'web' }
-  /** Session log root: stdio = workdir/.sessions; web = DSH_HOME/sessions (consistent with the profile composition). */
+  /** Session log root: stdio = workdir/.sessions; web = DSH_HOME/sessions; codex = CODEX_HOME/threads. */
   get sessionRoot() {
+    if (this.options.channel === 'codex') {
+      return join(this.options.workdir, '.codex')
+    }
     return this.isWeb ? join(this.options.workdir, 'dsh-home', 'sessions') : join(this.options.workdir, '.sessions')
   }
   get artifactsDir() { return join(this.options.workdir, 'artifacts') }
@@ -469,6 +473,25 @@ export class Foreman {
       this.timings.bootMs = this.channel.timings.bootMs
       this.gateway.publish({ kind: 'foreman.phase', phase: 'running', sessionId: this.options.sessionId, channel: 'web', dshUrl: info.url })
       return info
+    }
+
+    if (this.options.channel === 'codex') {
+      const harness = this.config?.harness ?? {}
+      this.channel = new CodexChannel({
+        workspaceDir: this.workspaceDir,
+        binary: harness.codex?.binary,
+        args: harness.codex?.args,
+        model: harness.codex?.model ?? this.options.model,
+        approvalPolicy: harness.codex?.approvalPolicy,
+        timeoutMs: harness.codex?.timeoutMs,
+        modelEnv,
+        envExtra: this.options.envExtra,
+      })
+      const init = await this.channel.start({ onEvent, onStatus })
+      this.phase = 'running'
+      this.timings.bootMs = this.channel.timings.bootMs
+      this.gateway.publish({ kind: 'foreman.phase', phase: 'running', sessionId: this.options.sessionId, channel: 'codex' })
+      return init
     }
 
     this.channel = new SdkChannel({

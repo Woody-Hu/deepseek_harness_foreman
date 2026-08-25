@@ -123,6 +123,55 @@ test('wire/openai-responses: Responses event stream over real HTTP; the codex al
   })
 })
 
+// ---------------------------------------------------------------- anthropic-messages wire
+
+test('wire/anthropic-messages: SSE event names and payloads over real HTTP; the claude alias is selectable', async () => {
+  await withGateway({ formatter: createEventFormatter('claude') }, async (gateway, port) => {
+    // message_start + content_block_start + 3 deltas + content_block_stop + message_delta + message_stop + DONE
+    const sub = await subscribe(port, { expected: 9 })
+    pushAll(gateway, textOnlyTurn)
+    await sub.settled
+    const events = sub.events.filter((event) => !event.done)
+    // The raw SSE data is the payload; the event name is not captured by the simple subscriber.
+    // Instead, assert on the JSON payload types:
+    const types = events.map((event) => event.data.type)
+    assert.deepEqual(types, [
+      'message_start',
+      'content_block_start',
+      'content_block_delta',
+      'content_block_delta',
+      'content_block_delta',
+      'content_block_stop',
+      'message_delta',
+      'message_stop',
+    ])
+    assert.equal(sub.events.at(-1).done, true)
+    // message_start envelope
+    const msgStart = events[0].data
+    assert.equal(msgStart.message.role, 'assistant')
+    assert.equal(msgStart.message.stop_reason, null)
+    // last delta is a text delta
+    const lastDelta = events.at(-2) // message_delta
+    assert.equal(lastDelta.data.delta.stop_reason, 'end_turn')
+    assert.equal(lastDelta.data.usage, null)
+  })
+})
+
+test('wire/anthropic-messages: tool call turn produces tool_use blocks on the wire', async () => {
+  await withGateway({ formatter: createEventFormatter('anthropic-messages') }, async (gateway, port) => {
+    const sub = await subscribe(port, { expected: 10 })
+    pushAll(gateway, multiStepToolTurn)
+    await sub.settled
+    const events = sub.events.filter((event) => !event.done)
+    const toolBlocks = events.filter((e) => e.data.type === 'content_block_start' && e.data.content_block?.type === 'tool_use')
+    assert.ok(toolBlocks.length > 0)
+    assert.equal(toolBlocks[0].data.content_block.name, 'bash')
+    const toolDeltas = events.filter((e) => e.data.type === 'content_block_delta' && e.data.delta?.type === 'input_json_delta')
+    assert.ok(toolDeltas.length > 0)
+    assert.ok(toolDeltas[0].data.delta.partial_json.includes('printf'))
+  })
+})
+
 // ---------------------------------------------------------------- replay (Last-Event-ID)
 
 test('wire/replay: Last-Event-ID resumption replays rendered wire lines (format-consistent)', async () => {
