@@ -1,0 +1,130 @@
+# Foreman dsh composition for the SDK stdio channel (deployment-owned
+# configuration; no dsh repository source is modified).
+# Baseline: examples/jsonrpc-agent/cordis.yml (the unattended JSON-RPC
+# orchestration). Differences:
+#   1. session-telemetry-otel added — driven by DSH_TELEMETRY_MODE /
+#      DSH_TELEMETRY_OTLP_URL environment variables, progressively publishing
+#      traces to cloud monitoring (a local mock OTLP collector in tests).
+#   2. compression pinned to zstd (production form; tests read this log).
+#   3. foreman resume-adapter added (a local relative-path plugin,
+#      materialized by the runner into plugins/ next to this file): the SDK
+#      narrow protocol has no session resume; this adapter reroutes
+#      sessionIds with existing persisted logs from agents.create to
+#      agents.resume, enabling cross-sandbox session resume.
+#   4. foreman telemetry-enrich added (the generic attribute pipeline of the
+#      same plugin family, same spec as the web channel — the mechanism is
+#      channel-agnostic): mounted on the session-telemetry/record waterfall,
+#      injecting deployment-side monitoring attributes (tenant/trace ids,
+#      context fields) per the rule table.
+# stdout carries JSON-RPC only; do not add console loggers or terminal UI.
+
+- id: foreman-resume-adapter
+  name: './plugins/resume-adapter.mjs'
+
+- id: foreman-telemetry-enrich
+  name: './plugins/telemetry-enrich.mjs'
+  config:
+    attributes:
+      - key: tenant.id
+        from: { env: FOREMAN_TENANT_ID }
+      - key: w3c.trace_id
+        from: { env: FOREMAN_W3C_TRACE_ID }
+      - key: deployment.region
+        value: cn-east-1
+      - key: cost.center
+        from: { context: costCenter }
+      - key: quota.tier
+        from: { context: quota.tier }
+      - key: user.pseudonym
+        from: { context: user.id }
+        transform: { hash: true }
+      - key: tool.sandbox_profile
+        from: { context: sandbox.profile }
+        when: { eventTypes: ['tool/*'] }
+      - key: session.id
+        value: INJECTED-MUST-NOT-WIN
+
+- id: sdk-jsonrpc-server
+  name: '@deepseek-ai/dsh-sdk-jsonrpc-server'
+  config:
+    maxTokensAsSuccess: !!js "process.env.DSH_MAX_TOKENS_AS_SUCCESS === undefined ? true : JSON.parse(process.env.DSH_MAX_TOKENS_AS_SUCCESS)"
+
+- id: llm-deepseek
+  name: '@deepseek-ai/dsh-llm-deepseek'
+  config:
+    thinking: enabled
+    reasoningEffort: max
+
+# Trace egress: with DSH_TELEMETRY_MODE=FULL the session log is mirrored as
+# OTLP/HTTP log records and streamed to exporter.url (pointing at a local
+# mock collector in tests).
+- id: session-telemetry-otel
+  name: '@deepseek-ai/dsh-session-telemetry-otel'
+  config:
+    mode: !!js process.env.DSH_TELEMETRY_MODE || 'DISABLED'
+    shutdownTimeoutMillis: 3000
+    exporter:
+      url: !!js process.env.DSH_TELEMETRY_OTLP_URL ?? 'http://127.0.0.1:4318/v1/logs'
+      compression: none
+      timeoutMillis: 1000
+    processor:
+      scheduledDelayMillis: 500
+      maxQueueSize: 2048
+      maxExportBatchSize: 2048
+      exportTimeoutMillis: 1500
+
+- id: subprocess
+  name: '@deepseek-ai/dsh-subprocess-local'
+
+- id: bash
+  name: '@deepseek-ai/dsh-bash-local'
+  config:
+    cwd: !!js process.env.DSH_CWD ?? process.cwd()
+    timeoutMs: 60000
+
+- id: agent-spine
+  name: '@deepseek-ai/dsh-agent-spine-demo'
+  config:
+    persona: !!js process.env.DSH_SYSTEM_PROMPT ?? 'You are a coding agent.'
+    workspaceContext: false
+    skills:
+      enabled: false
+    toolBash:
+      enableRunInBackground: false
+    toolJobs: false
+
+- id: sessions
+  name: '@deepseek-ai/dsh-session-persistence-jsonl'
+  config:
+    root: !!js process.env.DSH_SESSION_ROOT ?? './.sessions'
+    compression: !!js "process.env.DSH_SNAPSHOT === undefined ? 'zstd' : 'none'"
+
+- id: session-checkpoints
+  name: '@deepseek-ai/dsh-session-checkpoint-policy'
+
+- id: tool-todo
+  name: '@deepseek-ai/dsh-tool-todo'
+  config:
+    allowParallelInProgress: true
+
+- id: fs-local
+  name: '@deepseek-ai/dsh-fs-local'
+  config:
+    cwd: !!js process.env.DSH_CWD ?? process.cwd()
+
+- id: fs-observation-policy
+  name: '@deepseek-ai/dsh-fs-observation-policy'
+
+- id: tool-fs
+  name: '@deepseek-ai/dsh-tool-fs'
+
+- id: token-meter
+  name: '@deepseek-ai/dsh-token-meter'
+
+- id: compaction-basic
+  name: '@deepseek-ai/dsh-compaction-basic'
+  config:
+    thresholdRatio: 0.8
+    retainRatio: 0.16
+    maxTokens: 8192
+    compactionRetries: 1

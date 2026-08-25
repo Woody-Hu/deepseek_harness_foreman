@@ -1,0 +1,90 @@
+# Foreman web-channel patch overlay (deployment-owned configuration; no dsh
+# repository source is modified).
+#
+# `dsh web --patch <this file>`: this file is applied as a sibling patch list
+# after the profile's user layer, matching dsh-base / dsh-web-app bundle rows
+# by id and replacing those rows' config wholesale.
+#
+# The baseline (web profile = dsh-base + dsh-web-app bundle) already ships
+# everything the web channel needs:
+#   - sandbox + approval + permission stack: default preset workspace-write
+#     with approval 'ask' (overridable via DSH_PERMISSION_MODE; a model-initiated
+#     sandbox_permissions escalation -> approval/asked -> apiproxy pushes an
+#     approval/requested mux frame -> HITL)
+#   - llm-deepseek: baseURL falls back to $DEEPSEEK_BASE_URL (a trusted
+#     environment layer); the key resolves per request from the credential
+#     store (env first) by apiKeyEnv (default DEEPSEEK_API_KEY) — the same env
+#     wiring as the stdio channel
+#   - session-telemetry-otel: mode/exporter.url driven by DSH_TELEMETRY_* env
+#   - session-persistence-jsonl: root = dshHomePath('sessions') (= $DSH_HOME/
+#     sessions, matching foreman's web sessionRoot — the landing spot of
+#     cross-sandbox session resume)
+# This overlay does four things:
+#   1. webserver binds 127.0.0.1 + port 0 (an OS-assigned random port; the
+#      readiness line "dsh web: http://127.0.0.1:<port>" reflects the actual
+#      port — foreman parses it from stdout and opens the mux stream)
+#   2. telemetry processor tuned for fast flush (short assertion windows in
+#      tests; production keeps the base defaults' batch parameters)
+#   3. insert of the foreman telemetry-enrich plugin (materialized by the
+#      runner into the profile's plugins/ directory): the generalized
+#      attribute pipeline — the spec lives in config.attributes below, so a
+#      new monitoring dimension = one more rule (zero code); values arrive by
+#      env injection (flat variables + the FOREMAN_RUN_CONTEXT JSON context
+#      object)
+#   4. exporter.headers passes tenant headers through
+#      (OTLPExporterNodeConfigBase passes the field through verbatim) — the
+#      transport-level multi-tenant routing identifier, complementary to
+#      record-level attributes
+
+- id: webserver
+  config:
+    host: 127.0.0.1
+    port: 0
+
+- insert:
+    - id: foreman-telemetry-enrich
+      name: './plugins/telemetry-enrich.mjs'
+      config:
+        attributes:
+          # Source 1: flat env variables (injected via foreman envExtra)
+          - key: tenant.id
+            from: { env: FOREMAN_TENANT_ID }
+          - key: w3c.trace_id
+            from: { env: FOREMAN_W3C_TRACE_ID }
+          # Source 2: literals (written directly in the cloud config)
+          - key: deployment.region
+            value: cn-east-1
+          # Source 3: context fields (dot paths into the FOREMAN_RUN_CONTEXT
+          # JSON, nestable)
+          - key: cost.center
+            from: { context: costCenter }
+          - key: quota.tier
+            from: { context: quota.tier }
+          # Transform: first 16 hex chars of sha256 (pseudonymization)
+          - key: user.pseudonym
+            from: { context: user.id }
+            transform: { hash: true }
+          # Filter: tool/* events only (trailing '*' = prefix match)
+          - key: tool.sandbox_profile
+            from: { context: sandbox.profile }
+            when: { eventTypes: ['tool/*'] }
+          # Additivity protection: a rule named like a dsh-owned key never
+          # overrides it (session.id keeps its original value on the record)
+          - key: session.id
+            value: INJECTED-MUST-NOT-WIN
+
+- id: session-telemetry-otel
+  config:
+    mode: !!js process.env.DSH_TELEMETRY_MODE || 'DISABLED'
+    shutdownTimeoutMillis: 3000
+    exporter:
+      url: !!js process.env.DSH_TELEMETRY_OTLP_URL ?? 'http://127.0.0.1:4318/v1/logs'
+      headers:
+        x-tenant-id: !!js process.env.FOREMAN_TENANT_ID ?? 'tenant-unset'
+      compression: none
+      timeoutMillis: 1000
+    processor:
+      scheduledDelayMillis: 500
+      maxQueueSize: 2048
+      maxExportBatchSize: 2048
+      exportTimeoutMillis: 1500

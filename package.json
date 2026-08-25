@@ -1,0 +1,29 @@
+{
+  "name": "@deepseek-ai/foreman",
+  "version": "0.1.0",
+  "description": "Foreman — a cloud sandbox runner for DeepSeek Harness (dsh): workspace checkpoint chains, cross-sandbox session resume, secret interception, and event/trace forwarding.",
+  "type": "module",
+  "license": "MIT",
+  "private": true,
+  "engines": {
+    "node": ">=22.19"
+  },
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "scripts": {
+    "test": "node --test test/unit.test.js",
+    "test:e2e:basic": "node test/e2e/basic.e2e.js",
+    "test:e2e:cloud": "node test/e2e/cloud.e2e.js",
+    "test:e2e:web": "node test/e2e/web.e2e.js",
+    "test:e2e:checkpoint": "node test/e2e/checkpoint.e2e.js"
+  },
+  "keywords": [
+    "agent",
+    "sandbox",
+    "runner",
+    "checkpoint",
+    "deepseek"
+  ]
+}
