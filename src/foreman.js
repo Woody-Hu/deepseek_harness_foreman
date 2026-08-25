@@ -57,6 +57,7 @@ import { deleteArtifact, downloadArtifact, publishBusEvent, uploadArtifact } fro
 import { SdkChannel } from './channels/sdk-channel.js'
 import { WebChannel } from './channels/web-channel.js'
 import { createEventFormatter, renderSseLine } from './events/formats.js'
+import { loadForemanConfig, resolveConfigPath } from './config.js'
 import { TraceShipper } from './observability/trace-shipper.js'
 import { createSnapshotSink } from './storage/snapshot-sink.js'
 import { createEventBus } from './events/event-bus.js'
@@ -172,11 +173,18 @@ export class SseGateway {
   }
 
   close() {
-    // End all SSE subscriber connections first; otherwise server.close()
-    // waits forever on keep-alive streams that never end.
-    for (const subscriber of this.subscribers) subscriber.end()
+    // End all SSE subscriber connections first, and WAIT for each response
+    // to flush before server.close(): destroying a socket with an unflushed
+    // write buffer resets the connection and the subscriber loses the tail
+    // of the stream (observed with slow consumers on large streams).
+    const flushes = [...this.subscribers].map((subscriber) => new Promise((resolve) => {
+      subscriber.end(() => { resolve() })
+    }))
     this.subscribers.clear()
-    return new Promise((resolve) => { this.server.close(() => { resolve() }) })
+    return (async () => {
+      await Promise.all(flushes)
+      return await new Promise((resolve) => { this.server.close(() => { resolve() }) })
+    })()
   }
 }
 
@@ -202,8 +210,14 @@ export class SseGateway {
  * @param {object} [options.snapshot] workspace snapshot storage:
  *   createSnapshotSink configuration { kind:'local'|'object-store', ... } —
  *   credentials resolved dynamically from env (per call)
- * @param {object} [options.events] outbound event stream: { delivery:'sse'|'bus'|'both',
- *   format:'native'|'openai-chat', model?, bus? = createEventBus configuration }
+ * @param {object} [options.events] outbound event stream: { protocol?, delivery:'sse'|'bus'|'both',
+ *   model?, bus? = createEventBus configuration }. `protocol` selects the outbound SSE
+ *   protocol by registry id/alias (native | openai-chat | openai-responses/codex, ADR-0001);
+ *   the legacy `format` key is honored as an alias with lower precedence.
+ *   Per-key precedence (ADR-0002): constructor option > config file > default.
+ * @param {string} [options.configPath] runner configuration file (foreman.config.json) —
+ *   also settable via the FOREMAN_CONFIG env var; protocol/delivery/model/bus
+ *   defaults come from it when the constructor does not override them
  * @param {object} [options.git] local workspace git: { enabled, secretPatterns? } —
  *   secret values default to secretValues; baseline/turn commits + secret
  *   interception
@@ -366,14 +380,19 @@ export class Foreman {
       this.telemetryForChannel = telemetry
     }
 
-    // Outbound event stream: formatter + bus + delivery mode.
-    const events = this.options.events ?? {}
+    // Outbound event stream: formatter + bus + delivery mode. Protocol
+    // selection precedence (ADR-0002): constructor option > runner config
+    // file (configPath / FOREMAN_CONFIG) > built-in default 'native'.
+    if (this.config === undefined) {
+      this.config = await loadForemanConfig(resolveConfigPath(this.options))
+    }
+    const events = { ...this.config.events, ...this.options.events }
     if (events.bus !== undefined) {
       this.bus = createEventBus(events.bus)
       await this.bus.start?.() // the http bus has a background delivery loop; the memory bus has no start
     }
     this.gateway = new SseGateway({
-      formatter: createEventFormatter(events.format ?? 'native', { model: events.model }),
+      formatter: createEventFormatter(events.protocol ?? events.format ?? 'native', { model: events.model }),
       bus: this.bus,
       delivery: events.delivery ?? 'sse',
     })

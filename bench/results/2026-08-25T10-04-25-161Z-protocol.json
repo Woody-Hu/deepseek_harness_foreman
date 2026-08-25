@@ -1,0 +1,69 @@
+{
+  "timestamp": "2026-08-25T10:04:25.161Z",
+  "node": "v24.1.0",
+  "workload": {
+    "turns": 50,
+    "deltasPerTurn": 5,
+    "frames": 350,
+    "measuredRuns": 3
+  },
+  "protocols": [
+    {
+      "protocol": "native",
+      "formatterOnly": {
+        "ms": 0.022,
+        "framesPerSecond": 16076432,
+        "eventOutPerSecond": 16076432
+      },
+      "endToEnd": {
+        "framesPerSecond": 317663,
+        "wireBytesPerSecond": 70941316,
+        "wireEventCount": 350,
+        "wireKb": 76.3,
+        "latencyMs": {
+          "p50": 2.479,
+          "p95": 2.565,
+          "p99": 2.597
+        }
+      }
+    },
+    {
+      "protocol": "openai-chat",
+      "formatterOnly": {
+        "ms": 0.322,
+        "framesPerSecond": 1085510,
+        "eventOutPerSecond": 1240583
+      },
+      "endToEnd": {
+        "framesPerSecond": 274622,
+        "wireBytesPerSecond": 65395247,
+        "wireEventCount": 400,
+        "wireKb": 81.4,
+        "latencyMs": {
+          "p50": 1.887,
+          "p95": 2.021,
+          "p99": 2.046
+        }
+      }
+    },
+    {
+      "protocol": "openai-responses",
+      "formatterOnly": {
+        "ms": 0.311,
+        "framesPerSecond": 1123650,
+        "eventOutPerSecond": 2728863
+      },
+      "endToEnd": {
+        "framesPerSecond": 181103,
+        "wireBytesPerSecond": 115974673,
+        "wireEventCount": 850,
+        "wireKb": 218.9,
+        "latencyMs": {
+          "p50": 2.87,
+          "p95": 4.123,
+          "p99": 4.284
+        }
+      }
+    }
+  ]
+}

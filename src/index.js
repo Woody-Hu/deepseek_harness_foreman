@@ -18,6 +18,8 @@ export {
 export { isSecretOrExcludedPath, redactText, redactFileBuffer, redactJson } from './core/redact.js'
 export { uploadArtifact, downloadArtifact, deleteArtifact, publishBusEvent } from './control-plane.js'
 export { createEventFormatter, renderSseLine } from './events/formats.js'
+export { registerProtocol, resolveProtocol, listProtocols } from './events/protocols/registry.js'
+export { loadForemanConfig, resolveConfigPath } from './config.js'
 export { createEventBus } from './events/event-bus.js'
 export { TraceShipper } from './observability/trace-shipper.js'
 export { createSnapshotSink } from './storage/snapshot-sink.js'

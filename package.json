@@ -13,7 +13,9 @@
     ".": "./src/index.js"
   },
   "scripts": {
-    "test": "node --test test/unit.test.js",
+    "test": "node --test test/unit.test.js test/protocols.test.js test/gateway-wire.test.js",
+    "bench": "node bench/protocol.bench.js",
+    "bench:quick": "node bench/protocol.bench.js --quick",
     "test:e2e:basic": "node test/e2e/basic.e2e.js",
     "test:e2e:cloud": "node test/e2e/cloud.e2e.js",
     "test:e2e:web": "node test/e2e/web.e2e.js",
