@@ -44,5 +44,8 @@ export function createEventFormatter(format, options = {}) {
 /** Render an EventOut entry as an SSE wire line (including the trailing blank line). */
 export function renderSseLine(entry, id) {
   if (entry.type === 'done') return 'data: [DONE]\n\n'
+  if (entry.event !== undefined) {
+    return `event: ${entry.event}\nid: ${id}\ndata: ${JSON.stringify(entry.payload)}\n\n`
+  }
   return `id: ${id}\ndata: ${JSON.stringify(entry.payload)}\n\n`
 }

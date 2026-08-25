@@ -26,9 +26,11 @@ const eventTypes = (out) => payloads(out).map((payload) => payload.type)
 
 test('registry: built-ins are listed with ids, aliases, and metadata', () => {
   const protocols = listProtocols()
-  assert.deepEqual(protocols.map((protocol) => protocol.id), ['native', 'openai-chat', 'openai-responses'])
+  assert.deepEqual(protocols.map((protocol) => protocol.id), ['native', 'openai-chat', 'openai-responses', 'anthropic-messages'])
   const responses = protocols.find((protocol) => protocol.id === 'openai-responses')
   assert.deepEqual(responses.aliases, ['codex'])
+  const anthropic = protocols.find((protocol) => protocol.id === 'anthropic-messages')
+  assert.deepEqual(anthropic.aliases, ['claude'])
 })
 
 test('registry: aliases resolve to the same definition as the canonical id', () => {
@@ -36,7 +38,7 @@ test('registry: aliases resolve to the same definition as the canonical id', () 
 })
 
 test('registry: unknown protocol fails loud and lists what is available', () => {
-  assert.throws(() => resolveProtocol('anthropic'), /unknown protocol 'anthropic'.*native.*openai-chat.*openai-responses/s)
+  assert.throws(() => resolveProtocol('anthropic'), /unknown protocol 'anthropic'.*native.*openai-chat.*openai-responses.*anthropic-messages/s)
   // The formats façade preserves its historical wording (backwards compatibility)
   assert.throws(() => createEventFormatter('anthropic'), /unknown format/)
 })
@@ -202,6 +204,131 @@ test('openai-responses: assistant/message without a delta source is a whole-text
 test('openai-responses: the codex alias resolves the same adapter', () => {
   const out = run(createEventFormatter('codex'), textOnlyTurn)
   assert.ok(eventTypes(out).includes('response.output_text.delta'))
+})
+
+// ---------------------------------------------------------------- anthropic-messages (claude)
+
+test('anthropic-messages: text-only turn produces the full Anthropic event sequence', () => {
+  const out = run(createEventFormatter('anthropic-messages', { model: 'm3' }), textOnlyTurn)
+  const events = out.filter((entry) => entry.type === 'data').map((entry) => entry.event)
+  assert.deepEqual(events, [
+    'message_start',
+    'content_block_start',
+    'content_block_delta',
+    'content_block_delta',
+    'content_block_delta',
+    'content_block_stop',
+    'message_delta',
+    'message_stop',
+  ])
+  assert.equal(out.at(-1).type, 'done') // carrier-level turn separator
+  const [msgStart, blockStart, d1, d2, d3, blockStop, msgDelta, msgStop] = payloads(out)
+  // message_start envelope
+  assert.equal(msgStart.type, 'message_start')
+  assert.equal(msgStart.message.role, 'assistant')
+  assert.equal(msgStart.message.model, 'm3')
+  assert.equal(msgStart.message.stop_reason, null)
+  assert.deepEqual(msgStart.message.usage, { input_tokens: 0, output_tokens: 0 })
+  // content block lifecycle
+  assert.equal(blockStart.type, 'content_block_start')
+  assert.equal(blockStart.index, 0)
+  assert.equal(blockStart.content_block.type, 'text')
+  assert.equal(blockStart.content_block.text, '')
+  // text deltas
+  assert.equal(d1.delta.text, 'The workspace is ')
+  assert.equal(d2.delta.text, 'restored and ')
+  assert.equal(d3.delta.text, 'ready.')
+  // block stop
+  assert.equal(blockStop.type, 'content_block_stop')
+  assert.equal(blockStop.index, 0)
+  // message delta
+  assert.equal(msgDelta.type, 'message_delta')
+  assert.equal(msgDelta.delta.stop_reason, 'end_turn')
+  assert.equal(msgDelta.usage, null)
+  // message stop
+  assert.equal(msgStop.type, 'message_stop')
+  // stable message id within the turn
+  assert.equal(new Set([msgStart.message.id]).size, 1)
+})
+
+test('anthropic-messages: tool call becomes a tool_use content block', () => {
+  // Use the multiStepToolTurn first 3 frames (chunk + message + toolCall)
+  const partial = multiStepToolTurn.slice(0, 3)
+  const out = run(createEventFormatter('anthropic-messages'), partial)
+  const events = out.filter((entry) => entry.type === 'data').map((entry) => entry.event)
+  assert.deepEqual(events, [
+    'message_start',
+    'content_block_start',
+    'content_block_delta',
+    'content_block_stop',
+    'content_block_start',
+    'content_block_delta',
+    'content_block_stop',
+  ])
+  const textBlock = payloads(out)[1]
+  assert.equal(textBlock.content_block.type, 'text')
+  assert.equal(textBlock.content_block.text, '')
+  const toolBlock = payloads(out)[4]
+  assert.equal(toolBlock.content_block.type, 'tool_use')
+  assert.equal(toolBlock.content_block.name, 'bash')
+  assert.ok(toolBlock.content_block.id.startsWith('toolu_'))
+  assert.deepEqual(toolBlock.content_block.input, {})
+  const toolDelta = payloads(out)[5]
+  assert.equal(toolDelta.delta.type, 'input_json_delta')
+  assert.ok(toolDelta.delta.partial_json.includes('printf'))
+})
+
+test('anthropic-messages: turn/end with completed reason emits end_turn stop_reason', () => {
+  const out = run(createEventFormatter('anthropic-messages'), multiStepToolTurn)
+  const msgDelta = payloads(out).filter((p) => p.type === 'message_delta').at(-1)
+  assert.equal(msgDelta.delta.stop_reason, 'end_turn')
+  assert.equal(msgDelta.usage, null)
+})
+
+test('anthropic-messages: empty turn still yields a validly terminated empty message', () => {
+  const out = run(createEventFormatter('anthropic-messages'), emptyTurn)
+  const events = out.filter((entry) => entry.type === 'data').map((entry) => entry.event)
+  assert.deepEqual(events, ['message_start', 'message_delta', 'message_stop'])
+  assert.equal(out.at(-1).type, 'done')
+  const msgStart = payloads(out)[0]
+  assert.equal(msgStart.message.content.length, 0)
+})
+
+test('anthropic-messages: non-completed turn/end maps to the given stop_reason', () => {
+  const out = run(createEventFormatter('anthropic-messages'), failedTurn)
+  const msgDelta = payloads(out).filter((p) => p.type === 'message_delta').at(-1)
+  assert.equal(msgDelta.delta.stop_reason, 'aborted')
+})
+
+test('anthropic-messages: two turns produce two distinct message ids', () => {
+  const out = run(createEventFormatter('anthropic-messages'), twoTurns)
+  const msgStarts = payloads(out).filter((p) => p.type === 'message_start')
+  assert.equal(msgStarts.length, 2)
+  assert.notEqual(msgStarts[0].message.id, msgStarts[1].message.id)
+  assert.equal(out.filter((entry) => entry.type === 'done').length, 2)
+})
+
+test('anthropic-messages: the claude alias resolves the same adapter as anthropic-messages', () => {
+  const a = createEventFormatter('anthropic-messages')
+  const b = createEventFormatter('claude')
+  const outA = a.push(textOnlyTurn[0])
+  const outB = b.push(textOnlyTurn[0])
+  // Length and event types match (ids differ due to randomUUID per instance)
+  assert.equal(outA.length, outB.length)
+  assert.equal(outA[0].type, outB[0].type)
+  assert.equal(outA[0].event, outB[0].event)
+  assert.equal(outA[0].payload.type, outB[0].payload.type)
+  assert.equal(outA[0].payload.message.role, outB[0].payload.message.role)
+  assert.equal(outA[0].payload.message.model, outB[0].payload.message.model)
+})
+
+test('anthropic-messages: assistant/message without a delta source is a whole-text delta fallback', () => {
+  const out = run(createEventFormatter('anthropic-messages'), messageFallbackTurn)
+  const events = out.filter((entry) => entry.type === 'data').map((entry) => entry.event)
+  // message_start -> content_block_start -> content_block_delta -> content_block_stop -> message_delta -> message_stop
+  assert.ok(events.includes('content_block_delta'))
+  const deltas = payloads(out).filter((p) => p.type === 'content_block_delta')
+  assert.ok(deltas.some((d) => d.delta?.text === 'text that never streamed'))
 })
 
 // ---------------------------------------------------------------- config file (ADR-0002)
