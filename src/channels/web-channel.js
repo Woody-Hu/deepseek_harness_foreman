@@ -1,9 +1,12 @@
 /**
- * Web channel driver: launches `dsh web` (dsh-base + dsh-web-app bundle with a
- * cloud-delivered patch overlay).
+ * Web channel driver: launches `dsh web` from the published distribution
+ * package (ADR-0011) — the `@deepseek-ai/dsh` CLI booting the `web` profile
+ * (dsh-base + dsh-web-app bundle, auto-initialized under
+ * $DSH_HOME/profiles/web) with a cloud-delivered patch overlay.
  *
  * Exposes the same channel interface as the SDK channel (sdk-channel.js) and is
- * selected by foreman.js based on configuration. Differences and advantages:
+ * selected by channels/factory.js based on configuration. Differences and
+ * advantages:
  *   - The transport is HTTP (unary POST /api/<method> + POST /api/respond) plus
  *     a WebSocket downlink (/api/events.mux) — stdio is no longer occupied.
  *     A plain GET against the mux endpoint gets a 426; the SSE framing only
@@ -32,6 +35,7 @@ import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { cp, mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
+import { resolveHarnessEntry } from '../harness-resolution.js'
 
 /** Readiness timeout (tsx cold start + dsh web composition loading is slow). */
 const BOOT_TIMEOUT_MS = 90_000

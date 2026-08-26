@@ -1,13 +1,21 @@
 /**
- * SDK channel driver: launches dsh over stdio NDJSON JSON-RPC (jsonrpc-demo bin).
+ * SDK channel driver: launches the dsh JSON-RPC stdio runtime from its
+ * published distribution package (ADR-0011).
  *
- * Implements the rpcId request/response pairing of the SDK protocol. Channel
- * interface (mirrored by web-channel.js, consumed by foreman.js):
+ * The entry is `@deepseek-ai/dsh-sdk-jsonrpc-demo`'s closed-runtime bin
+ * (`packaged-bin`): bare plugin names in the cloud-delivered cordis.yml
+ * resolve from the installed runtime closure, while relative names
+ * (`./plugins/*` — foreman's adapter plugins, materialized next to the
+ * config) stay config-relative. The channel speaks NDJSON JSON-RPC 2.0 on
+ * the child's stdio and implements the rpcId request/response pairing of
+ * the SDK protocol. Channel interface (mirrored by web-channel.js and
+ * codex-channel.js, consumed by channels/factory.js):
  *   start(handlers) -> handshake result; prompt(sessionId, text, opts) -> { reason }
  *   shutdown() -> exitCode; sessionRoot -> session log root directory
  */
 import { spawn } from 'node:child_process'
-import { join } from 'node:path'
+import { dirname } from 'node:path'
+import { resolveHarnessEntry } from '../harness-resolution.js'
 
 /** stdio NDJSON JSON-RPC 2.0 client. */
 class JsonRpcClient {
@@ -57,8 +65,9 @@ class JsonRpcClient {
 
 /**
  * @param {object} options
- * @param {string} options.repoRoot dsh repository root (cwd of the tsx source launch)
- * @param {string} options.configPath absolute path of cordis.yml
+ * @param {string} options.configPath absolute path of cordis.yml (the config
+ *   project directory is the child's cwd; `./plugins/*` relative names in the
+ *   composition resolve against it)
  * @param {string} options.workspaceDir session workspace (absolute; must be identical across runs)
  * @param {string} options.sessionRoot session log root (DSH_SESSION_ROOT)
  * @param {object} options.modelEnv { DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL }
@@ -66,6 +75,8 @@ class JsonRpcClient {
  * @param {object} [options.envExtra] extra env injected into the dsh child process (tenant/trace ids — same non-persisted channel as secrets)
  * @param {string} [options.provider] initialize parameter (default deepseek-official)
  * @param {string} [options.model] initialize parameter (default deepseek-v4-pro)
+ * @param {string} [options.binary] harness entry override (config harness.dshSdk.binary;
+ *   default: the installed @deepseek-ai/dsh-sdk-jsonrpc-demo packaged bin, ADR-0011)
  */
 export class SdkChannel {
   constructor(options) {
@@ -79,13 +90,10 @@ export class SdkChannel {
   /** Launch the dsh child process and complete the initialize handshake. handlers: { onEvent, onStatus } */
   async start(handlers) {
     const t0 = Date.now()
-    const { repoRoot, configPath, workspaceDir, sessionRoot, modelEnv, telemetry } = this.options
-    this.child = spawn(process.execPath, [
-      '--import', 'tsx',
-      join(repoRoot, 'packages/examples/jsonrpc-demo/src/bin.ts'),
-      configPath,
-    ], {
-      cwd: repoRoot,
+    const { configPath, workspaceDir, sessionRoot, modelEnv, telemetry } = this.options
+    const entry = resolveHarnessEntry('@deepseek-ai/dsh-sdk-jsonrpc-demo', 'packaged-bin', this.options.binary)
+    this.child = spawn(process.execPath, [entry, configPath], {
+      cwd: dirname(configPath),
       // Secrets exist only in the child process environment (memory), never in files
       env: {
         ...process.env,

@@ -17,6 +17,7 @@ edited in place after acceptance.
 | [0008](0008-harness-protocol-testing-and-benchmarks.md) | Independent testing and benchmark strategy for harness protocols | Proposed |
 | [0009](0009-channel-naming.md) | Harness-scoped channel naming (`dsh-sdk` / `dsh-web` / `codex`) | Accepted |
 | [0010](0010-overlap-scheduling.md) | Overlap scheduling for run-lifecycle I/O | Accepted |
+| [0011](0011-distribution-package-harness-launch.md) | Distribution-package harness launch and config-only channel switching | Accepted |
 
 ## Process
 
