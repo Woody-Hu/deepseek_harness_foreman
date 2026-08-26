@@ -1,6 +1,7 @@
 /**
- * Web channel driver: launches `dsh web` (dsh-base + dsh-web-app bundle with a
- * cloud-delivered patch overlay).
+ * Web channel driver: launches `dsh web` (the `dsh` CLI of the
+ * @deepseek-ai/dsh npm distribution — ADR-0012; no source checkout involved)
+ * with a cloud-delivered patch overlay.
  *
  * Exposes the same channel interface as the SDK channel (sdk-channel.js) and is
  * selected by foreman.js based on configuration. Differences and advantages:
@@ -33,7 +34,7 @@ import { randomUUID } from 'node:crypto'
 import { cp, mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 
-/** Readiness timeout (tsx cold start + dsh web composition loading is slow). */
+/** Readiness timeout (dsh web composition loading is slow, especially cold). */
 const BOOT_TIMEOUT_MS = 90_000
 
 /** HTTP client for POST /api/<method> (ClientRequest envelope) and POST /api/respond. */
@@ -78,7 +79,6 @@ class WebApiClient {
 
 /**
  * @param {object} options
- * @param {string} options.repoRoot dsh repository root
  * @param {string} options.patchPath cloud-delivered web profile patch overlay (absolute path)
  * @param {string} options.workspaceDir session workspace (absolute path; must stay identical
  *   across turns — resume locates the session by cwd)
@@ -90,6 +90,7 @@ class WebApiClient {
  * @param {string} [options.pluginsDir] runner-bundled local plugin directory (materialized to
  *   <dshHome>/profiles/web/plugins — the loader root of the profile launch face is anchored
  *   at the profile directory)
+ * @param {string} [options.command] harness binary override (default 'dsh' from PATH — ADR-0012)
  */
 export class WebChannel {
   constructor(options) {
@@ -108,7 +109,7 @@ export class WebChannel {
    */
   async start(handlers) {
     const t0 = Date.now()
-    const { repoRoot, patchPath, workspaceDir, dshHome, modelEnv, telemetry } = this.options
+    const { patchPath, workspaceDir, dshHome, modelEnv, telemetry } = this.options
     this.handlers = handlers
     // Materialize local plugins into the profile directory: the loader root of the
     // profile launch face (dsh web = profile 'web') is anchored at
@@ -120,19 +121,16 @@ export class WebChannel {
       await mkdir(profilePlugins, { recursive: true })
       await cp(this.options.pluginsDir, profilePlugins, { recursive: true })
     }
-    this.child = spawn(process.execPath, [
-      '--import', 'tsx',
-      join(repoRoot, 'apps/cli/src/bin.ts'),
+    this.child = spawn(this.options.command ?? 'dsh', [
       'web',
       '--patch', patchPath,
       '--no-open',
     ], {
-      // cwd=repoRoot (tsx resolves from the repository node_modules). The
-      // workspace boundary is not decided by the process cwd: sandbox-policy
+      // The workspace boundary is not decided by the process cwd: sandbox-policy
       // and fs tools resolve relative paths against session.header.cwd — set
       // below by ensureSession's session.create({cwd: workspaceDir}) and kept
       // identical across turns.
-      cwd: repoRoot,
+      cwd: workspaceDir,
       env: {
         ...process.env,
         ...(this.options.envExtra ?? {}), // extra injection (tenant/trace ids etc. — same in-memory channel as secrets)

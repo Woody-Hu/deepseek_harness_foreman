@@ -20,9 +20,11 @@
  * resume.
  *
  * Usage: node test/e2e/basic.e2e.js [--keep] (any cwd; --keep preserves the
- * run directory). Requires the dsh repository build (`pnpm run build`).
+ * run directory). Requires the dsh npm distribution on PATH (ADR-0012; see
+ * README "Prerequisites"); skips when the binary is absent.
  */
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { execFile } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Foreman } from '../../src/foreman.js'
@@ -32,8 +34,17 @@ import { startMockControlPlane } from '../mocks/control-plane.js'
 import { startMockModel } from '../mocks/model.js'
 import { startMockOtlpCollector } from '../mocks/otlp.js'
 
-const repoRoot = new URL('../../../../', import.meta.url).pathname
+const repoDir = new URL('../../', import.meta.url).pathname // foreman repository root
 const keep = process.argv.includes('--keep')
+
+// Skip when the dsh distribution binary is unavailable (ADR-0012)
+const dshAvailable = await new Promise((resolve) => {
+  execFile('dsh-jsonrpc-agent', [], (error) => { resolve(error?.code !== 'ENOENT') })
+})
+if (!dshAvailable) {
+  console.log('SKIP: dsh-jsonrpc-agent not found on PATH (install: npm install -g @deepseek-ai/dsh-sdk-jsonrpc-demo — see README Prerequisites)')
+  process.exit(0)
+}
 
 const t0 = Date.now()
 const log = (...args) => { console.log(`[+${((Date.now() - t0) / 1000).toFixed(1)}s]`, ...args) }
@@ -94,7 +105,7 @@ await writeFile(join(seedDir, 'src', 'app.js'), 'export function main() { return
 await writeFile(join(seedDir, '.env'), `API_KEY=sk-seed-env-secret-77c1\n`) // must be excluded from packaging
 const seedArchive = join(base, 'seed.tar.gz')
 await archiveDirectory(seedDir, seedArchive)
-await uploadArtifact(controlPlane, agentId, `${sessionId}/cordis.yml`, await readFile(join(repoRoot, 'foreman/solution/cordis.yml')))
+await uploadArtifact(controlPlane, agentId, `${sessionId}/cordis.yml`, await readFile(join(repoDir, 'cordis.yml')))
 await uploadArtifact(controlPlane, agentId, `${sessionId}/workspace.tar.gz`, await readFile(seedArchive))
 log('object storage seeded (cordis.yml + workspace.tar.gz containing .env)')
 
@@ -103,9 +114,8 @@ console.log('\n=== RUN 1: cold start (multi-step tool task) ===')
 const model1 = await startMockModel()
 const otlp = await startMockOtlpCollector()
 const foreman1 = new Foreman({
-  repoRoot,
   workdir: sandboxDir,
-  pluginsDir: join(repoRoot, 'foreman/solution/plugins'), // runner-bundled adapter plugins (session resume + attribute pipeline)
+  pluginsDir: join(repoDir, 'plugins'), // runner-bundled adapter plugins (session resume + attribute pipeline)
   agentId,
   sessionId,
   modelEnv: {
@@ -241,9 +251,8 @@ sse.abort()
 console.log('\n=== RUN 2: cross-sandbox session resume (same agentId+sessionId+mount path) ===')
 const model2 = await startMockModel() // a fresh model endpoint in the new "sandbox"
 const foreman2 = new Foreman({
-  repoRoot,
   workdir: sandboxDir,
-  pluginsDir: join(repoRoot, 'foreman/solution/plugins'),
+  pluginsDir: join(repoDir, 'plugins'),
   agentId,
   sessionId,
   modelEnv: {

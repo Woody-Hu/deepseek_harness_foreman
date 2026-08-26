@@ -29,9 +29,12 @@
  *     never enter commits -> never enter any pack -> do not exist after
  *     restore
  *
- * Usage: node test/e2e/checkpoint.e2e.js [--keep]
+ * Usage: node test/e2e/checkpoint.e2e.js [--keep]. Requires the dsh npm
+ * distribution on PATH (ADR-0012; see README "Prerequisites"); skips when
+ * the binary is absent.
  */
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { execFile } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Foreman } from '../../src/foreman.js'
@@ -40,8 +43,17 @@ import { startMockControlPlane } from '../mocks/control-plane.js'
 import { startMockModel } from '../mocks/model.js'
 import { archiveDirectory, extractArchive } from '../../src/core/workspace.js'
 
-const repoRoot = new URL('../../../../', import.meta.url).pathname
+const repoDir = new URL('../../', import.meta.url).pathname
 const keep = process.argv.includes('--keep')
+
+// Skip when the dsh distribution binary is unavailable (ADR-0012)
+const dshAvailable = await new Promise((resolve) => {
+  execFile('dsh-jsonrpc-agent', [], (error) => { resolve(error?.code !== 'ENOENT') })
+})
+if (!dshAvailable) {
+  console.log('SKIP: dsh-jsonrpc-agent not found on PATH (install: npm install -g @deepseek-ai/dsh-sdk-jsonrpc-demo — see README Prerequisites)')
+  process.exit(0)
+}
 
 const t0 = Date.now()
 const log = (...args) => { console.log(`[+${((Date.now() - t0) / 1000).toFixed(1)}s]`, ...args) }
@@ -75,7 +87,7 @@ await writeFile(join(seedDir, 'README.md'), '# seed workspace\n\ncheckpoint chai
 await writeFile(join(seedDir, 'src', 'app.js'), 'export function main() { return 1 }\n')
 const seedArchive = join(base, 'seed.tar.gz')
 await archiveDirectory(seedDir, seedArchive)
-await uploadArtifact(controlPlane, agentId, `${sessionId}/cordis.yml`, await readFile(join(repoRoot, 'foreman/solution/cordis.yml')))
+await uploadArtifact(controlPlane, agentId, `${sessionId}/cordis.yml`, await readFile(join(repoDir, 'cordis.yml')))
 await uploadArtifact(controlPlane, agentId, `${sessionId}/workspace.tar.gz`, await readFile(seedArchive))
 log('object storage seeded (cordis.yml + workspace.tar.gz)')
 
@@ -133,9 +145,8 @@ for (let round = 1; round <= ROUNDS; round += 1) {
 
   modelRequestsAtTurn[round] = model.requests.length
   const foreman = new Foreman({
-    repoRoot,
     workdir: sandboxDir,
-    pluginsDir: join(repoRoot, 'foreman/solution/plugins'),
+    pluginsDir: join(repoDir, 'plugins'),
     agentId,
     sessionId,
     modelEnv: {

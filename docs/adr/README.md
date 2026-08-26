@@ -18,6 +18,7 @@ edited in place after acceptance.
 | [0009](0009-channel-naming.md) | Harness-scoped channel naming (`dsh-sdk` / `dsh-web` / `codex`) | Accepted |
 | [0010](0010-overlap-scheduling.md) | Overlap scheduling for run-lifecycle I/O | Accepted (3a superseded by ADR-0011) |
 | [0011](0011-session-boundary-overlap-scheduling.md) | Session-boundary overlap scheduling | Accepted |
+| [0012](0012-dsh-distribution-launch.md) | dsh channels launch from the npm distribution | Accepted |
 
 ## Process
 

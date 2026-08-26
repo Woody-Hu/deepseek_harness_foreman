@@ -23,7 +23,7 @@
  *              reclaim the sandbox
  *
  * Channels (canonical ids per ADR-0009; legacy aliases 'stdio'/'web' accepted):
- *   channel='dsh-sdk'  dsh SDK JSON-RPC (channels/sdk-channel.js): jsonrpc-demo
+ *   channel='dsh-sdk'  dsh SDK JSON-RPC (channels/sdk-channel.js): dsh-jsonrpc-agent
  *                      bin + NDJSON stdio; session resume needs the bundled
  *                      resume-adapter plugin; no HITL
  *   channel='dsh-web'  dsh web apiproxy (channels/web-channel.js): dsh web +
@@ -200,11 +200,13 @@ export class SseGateway {
 
 /**
  * @param {object} options
- * @param {string} options.repoRoot dsh repository root (cwd of the tsx source launch)
  * @param {string} options.workdir isolated directory for this run (workspace/sessions/artifacts live under it)
  * @param {'dsh-sdk'|'dsh-web'|'codex'} [options.channel] harness channel, canonical ids per
  *   ADR-0009 (legacy aliases 'stdio'/'web' accepted); default 'dsh-sdk'; also
  *   settable via the config file's harness.channel (constructor wins)
+ * @param {object} [options.dsh] dsh harness binaries (constructor level; override the config
+ *   file's harness.dsh — ADR-0012): { command?, jsonrpcCommand? } — both default
+ *   from PATH ('dsh' for the web channel, 'dsh-jsonrpc-agent' for the SDK channel)
  * @param {string} options.agentId object storage bucket (agent dimension)
  * @param {string} options.sessionId external session id (caller-defined; reuse across runs = session resume)
  * @param {object} options.modelEnv { DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL } — env-injected only, never written to disk
@@ -290,6 +292,8 @@ export class Foreman {
   async #resolveChannel() {
     const config = await this.#ensureConfig()
     this.channelId = resolveChannelId(this.options.channel ?? config.harness?.channel ?? 'dsh-sdk')
+    // dsh harness binaries (ADR-0012): constructor option > config file > PATH defaults
+    this.dshOptions = { ...config.harness?.dsh, ...this.options.dsh }
     return this.channelId
   }
 
@@ -425,10 +429,10 @@ export class Foreman {
     this.timings.prepareMs = Date.now() - t0
   }
 
-  /** Launch dsh over the channel + gateway (format/delivery) + trace shipper + handshake/readiness. */
+  /** Launch the harness over the channel + gateway (format/delivery) + trace shipper + handshake/readiness. */
   async start() {
     const t0 = Date.now()
-    const { repoRoot, modelEnv, telemetry } = this.options
+    const { modelEnv, telemetry } = this.options
 
     // Trace shipper: dsh's OTLP is repointed at the local receiver; cloud
     // forwarding is isolated asynchronously.
@@ -476,7 +480,7 @@ export class Foreman {
 
     if (this.isWeb) {
       this.channel = new WebChannel({
-        repoRoot,
+        command: this.dshOptions.command,
         patchPath: this.configPath,
         workspaceDir: this.workspaceDir,
         dshHome: join(this.options.workdir, 'dsh-home'),
@@ -556,8 +560,8 @@ export class Foreman {
     }
 
     this.channel = new SdkChannel({
-      repoRoot,
       configPath: this.configPath,
+      command: this.dshOptions.jsonrpcCommand,
       workspaceDir: this.workspaceDir,
       sessionRoot: this.sessionRoot,
       modelEnv,

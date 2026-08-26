@@ -194,7 +194,6 @@ The inbound harness channel is selected per run via configuration (ADR-0005):
 import { Foreman } from '@deepseek-ai/foreman'
 
 const foreman = new Foreman({
-  repoRoot,                          // harness repository root
   workdir,                           // isolated run directory (fixed path across runs)
   channel: 'dsh-web',                // or 'dsh-sdk', 'codex' (legacy: 'stdio', 'web')
   agentId, sessionId,                // object-storage coordinates + session identity
