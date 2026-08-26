@@ -339,6 +339,29 @@ test('git-workspace: commitAll returns committed:false when nothing changed', as
   assert.deepEqual(again.violations, [])
 })
 
+test('git-workspace: branch and identity are configurable (no hard-coded git wiring); defaults apply when omitted', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'git-ws-opts-'))
+  await mkdir(cwd, { recursive: true })
+  await writeFile(join(cwd, 'a.txt'), 'a\n')
+  const git = new GitWorkspace({
+    cwd,
+    branch: 'foreman-run',
+    identity: { name: 'custom-runner', email: 'runner@example.test' },
+  })
+  await git.ensureRepo()
+  await git.commitBaseline()
+  // The configured initial branch is checked out and the commit carries the
+  // configured identity (works without any global git config)
+  assert.equal((await git.git(['branch', '--show-current'])).trim(), 'foreman-run')
+  const head = await git.git(['log', '-1', '--format=%an <%ae>'])
+  assert.equal(head.trim(), 'custom-runner <runner@example.test>')
+  assert.notEqual(await git.headOid(), '')
+  // Sparse option objects must not clobber the defaults with undefined
+  const sparse = new GitWorkspace({ cwd: cwd, secretValues: undefined })
+  assert.equal(sparse.options.branch, 'main')
+  assert.deepEqual(sparse.options.identity, { name: 'foreman', email: 'foreman@localhost' })
+})
+
 // ---------------------------------------------------------------- checkpoint
 
 test('checkpoint: skip-list retention policy — deterministic distribution (dense near, exponentially sparse far, includes 0 and n)', () => {

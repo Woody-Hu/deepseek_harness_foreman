@@ -1,6 +1,6 @@
 /**
- * Run-pipeline benchmark (ADR-0010): A/B measures overlap scheduling on REAL
- * work — the real codex binary driving a multi-turn sandbox, real git
+ * Run-pipeline benchmark (ADR-0011): measures the run lifecycle critical path
+ * on REAL work — the real codex binary driving a multi-turn sandbox, real git
  * commits, real tar/gzip pack builds, real HTTP uploads/downloads against a
  * disk-backed object store. Only the model endpoint is scripted (a local
  * Responses-API fixture with a per-request delay — the workload generator;
@@ -8,27 +8,24 @@
  *
  * Workload per run: one sandbox, N turns. Each turn's exec_command writes
  * PAYLOAD_MB of incompressible data (dd /dev/urandom) — checkpoint pack cost
- * C is real compression + upload work; DELAY_MS makes execution time E
+ * is real compression + upload work; DELAY_MS makes execution time
  * configurable through the scripted model latency.
  *
- * Modes (same work, only `checkpoints.overlap` differs):
- *   serial   overlap=false — every pack is built+uploaded inside publish(),
- *            fully on the critical path
- *   overlap  overlap=true  — each turn's pack is built+uploaded on the
- *            background chain while the next turn executes (ADR-0010 3a)
- *
- * Performance model (ADR-0010): saved ≈ Σᵢ₌₁^{N-1} min(Cᵢ, Eᵢ₊₁) − contention.
- * The projection is computed from the serial run's own measured constants
- * (E from per-turn wall time, C from per-pack sync records — real timers in
- * the real path) and verified against the observed T_serial − T_overlap.
+ * Measured critical-path breakdown (per run, median over MEASURED_RUNS):
+ *   prepare / boot / per-turn execution / collect / publish, plus the
+ *   per-pack checkpoint sync timings recorded inside publish()'s retention
+ *   pass (foreman.ckptSyncRecords, real timers in the real path). Historical
+ *   A/B context: ADR-0010 measured a background-sync design hiding ΣC under
+ *   execution; ADR-0011 removed it for simplicity — this benchmark now tracks
+ *   the occupancy cost of that decision.
  *
  * Integrity gates (no benchmarking a broken pipeline, no derived numbers):
  *   - every turn's payload file exists with the expected size (the dd workload
  *     actually ran inside the sandbox)
+ *   - every pack is built+uploaded inside publish()'s retention pass (the
+ *     ADR-0011 scheduling claim)
  *   - a fresh restore from the published checkpoint index reproduces the
  *     final workspace bit-for-bit (content manifest equality)
- *   - the A/B is what it claims: serial runs upload all N packs at publish,
- *     overlap runs upload all N packs in the background
  *
  * Run: node bench/run-pipeline.bench.js [--quick] [--keep]
  *        [--turns N] [--payload-mb N] [--delay-ms N] [--runs N]
@@ -57,7 +54,7 @@ const TURNS = arg('turns', quick ? 3 : 5)
 const PAYLOAD_MB = arg('payload-mb', quick ? 2 : 8)
 const DELAY_MS = arg('delay-ms', quick ? 300 : 600)
 const MEASURED_RUNS = arg('runs', quick ? 1 : 3)
-const WARMUP_PAIRS = quick ? 0 : 1
+const WARMUP_RUNS = quick ? 0 : 1
 const SEED_MB = quick ? 1 : 4
 const PAYLOAD_BYTES = PAYLOAD_MB * 1024 * 1024
 
@@ -101,10 +98,10 @@ async function contentManifest(dir) {
  * One benchmark run: fresh sessionId, cold sandbox, TURNS prompts, publish,
  * then a restore-integrity pass against the produced checkpoint chain.
  *
- * @returns per-run measurements { mode, runMs, prepareMs, bootMs, turnMs[], collectMs,
- *          publishMs, drainMs, packSyncs[], restoredBytes }
+ * @returns per-run measurements { runMs, prepareMs, bootMs, turnMs[], collectMs,
+ *          publishMs, packSyncs[], restoredBytes }
  */
-async function runOnce({ mode, sessionId, sandboxDir, controlPlane, model, seedBuffer }) {
+async function runOnce({ sessionId, sandboxDir, controlPlane, model, seedBuffer }) {
   await uploadArtifact(controlPlane, 'bench-run-pipeline', `${sessionId}/workspace.tar.gz`, seedBuffer)
   await wipeDir(sandboxDir)
   await mkdir(sandboxDir, { recursive: true })
@@ -117,7 +114,8 @@ async function runOnce({ mode, sessionId, sandboxDir, controlPlane, model, seedB
     controlPlane,
     secretValues: ['bench-key'],
     git: { enabled: true },
-    checkpoints: { recentKeep: TURNS + 1, perLevel: 1, rebaseAfter: 0, overlap: mode === 'overlap' },
+    // recentKeep=TURNS+1 keeps every turn -> one pack per turn (uniform sync cost)
+    checkpoints: { recentKeep: TURNS + 1, perLevel: 1, rebaseAfter: 0 },
   })
 
   const runStarted = Date.now()
@@ -128,7 +126,7 @@ async function runOnce({ mode, sessionId, sandboxDir, controlPlane, model, seedB
     const promptStarted = Date.now()
     const { reason } = await foreman.prompt(`please record the benchmark progress: BENCH TURN ${turn}`, { timeoutMs: 300_000 })
     turnMs.push(Date.now() - promptStarted)
-    gate(`turn ${turn} completed (${mode})`, reason?.kind === 'completed', JSON.stringify(reason))
+    gate(`turn ${turn} completed`, reason?.kind === 'completed', JSON.stringify(reason))
   }
   const collectStarted = Date.now()
   await foreman.collect()
@@ -144,10 +142,10 @@ async function runOnce({ mode, sessionId, sandboxDir, controlPlane, model, seedB
     const info = await stat(join(sandboxDir, 'workspace', 'turns', `turn-${turn}.bin`))
     gate(`turn ${turn} payload size`, info.size === PAYLOAD_BYTES, `${info.size} != ${PAYLOAD_BYTES}`)
   }
-  // Gate: the A/B is what it claims — serial uploads every pack at publish,
-  // overlap uploads every pack in the background
-  gate(`pack sync phases (${mode})`,
-    packSyncs.length === TURNS && packSyncs.every((entry) => entry.phase === (mode === 'overlap' ? 'background' : 'publish')),
+  // Gate: the scheduling claim — every pack is built+uploaded inside
+  // publish()'s retention pass (ADR-0011: no background syncs)
+  gate('pack sync phases',
+    packSyncs.length === TURNS && packSyncs.every((entry) => entry.phase === 'publish'),
     JSON.stringify(packSyncs.map(({ turn, phase }) => ({ turn, phase }))))
 
   // Gate: restore integrity — a fresh sandbox restores the workspace
@@ -171,14 +169,12 @@ async function runOnce({ mode, sessionId, sandboxDir, controlPlane, model, seedB
     `${Object.keys(restoredManifest).length} vs ${Object.keys(finalManifest).length} files`)
 
   return {
-    mode,
     runMs,
     prepareMs: foreman.timings.prepareMs,
     bootMs: foreman.timings.bootMs,
     turnMs,
     collectMs,
     publishMs: foreman.timings.publishMs ?? null,
-    drainMs: foreman.timings.checkpointDrainMs ?? 0,
     packSyncs,
     workspaceFiles: Object.keys(finalManifest).length,
   }
@@ -211,27 +207,21 @@ await import('../src/core/workspace.js').then(({ archiveDirectory }) => archiveD
 const seedBuffer = await readFile(seedArchive)
 log(`seed workspace: ${SEED_MB} MiB`)
 
-console.log('\nforeman run-pipeline benchmark (ADR-0010 overlap scheduling, A/B on real work)')
+console.log('\nforeman run-pipeline benchmark (ADR-0011 critical-path breakdown, real work)')
 console.log(`workload: ${TURNS} turns x ${PAYLOAD_MB} MiB incompressible payload, ${DELAY_MS}ms scripted model latency per request`)
-console.log(`method: ${WARMUP_PAIRS} warmup pair(s) + ${MEASURED_RUNS} measured pair(s), median reported\n`)
+console.log(`method: ${WARMUP_RUNS} warmup run(s) + ${MEASURED_RUNS} measured run(s), median reported\n`)
 
 const runDetails = []
 let runCounter = 0
-const pairs = WARMUP_PAIRS + MEASURED_RUNS
-for (let pair = 0; pair < pairs; pair += 1) {
-  const measured = pair >= WARMUP_PAIRS
-  // Alternate the mode order across pairs (serial first on odd pairs) so
-  // disk-cache/system drift cannot bias one mode systematically
-  const modes = pair % 2 === 0 ? ['serial', 'overlap'] : ['overlap', 'serial']
-  for (const mode of modes) {
-    runCounter += 1
-    log(`pair ${pair + 1}/${pairs} [${measured ? 'measured' : 'warmup'}] ${mode} run`)
-    const result = await runOnce({ mode, sessionId: `bench-${runCounter}-${mode}`, sandboxDir, controlPlane, model, seedBuffer })
-    if (measured) runDetails.push(result)
-  }
+for (let run = 0; run < WARMUP_RUNS + MEASURED_RUNS; run += 1) {
+  const measured = run >= WARMUP_RUNS
+  runCounter += 1
+  log(`run ${run + 1}/${WARMUP_RUNS + MEASURED_RUNS} [${measured ? 'measured' : 'warmup'}]`)
+  const result = await runOnce({ sessionId: `bench-${runCounter}`, sandboxDir, controlPlane, model, seedBuffer })
+  if (measured) runDetails.push(result)
 }
 
-// ---------------------------------------------------------------- model + report
+// ---------------------------------------------------------------- report
 
 const median = (values) => {
   const sorted = [...values].sort((a, b) => a - b)
@@ -240,67 +230,41 @@ const median = (values) => {
 }
 const round = (ms) => Number(ms.toFixed(0))
 
-const byMode = (mode) => runDetails.filter((run) => run.mode === mode)
-const summarise = (mode) => {
-  const runs = byMode(mode)
-  return {
-    runMs: median(runs.map((run) => run.runMs)),
-    executionMs: median(runs.map((run) => run.turnMs.reduce((sum, ms) => sum + ms, 0))),
-    packSyncMs: median(runs.map((run) => run.packSyncs.reduce((sum, entry) => sum + entry.ms, 0))),
-    backgroundPackMs: median(runs.map((run) => run.packSyncs.filter((entry) => entry.phase === 'background').reduce((sum, entry) => sum + entry.ms, 0))),
-    prepareMs: median(runs.map((run) => run.prepareMs)),
-    collectMs: median(runs.map((run) => run.collectMs)),
-    drainMs: median(runs.map((run) => run.drainMs)),
-  }
+const summary = {
+  runMs: median(runDetails.map((run) => run.runMs)),
+  executionMs: median(runDetails.map((run) => run.turnMs.reduce((sum, ms) => sum + ms, 0))),
+  prepareMs: median(runDetails.map((run) => run.prepareMs)),
+  bootMs: median(runDetails.map((run) => run.bootMs)),
+  collectMs: median(runDetails.map((run) => run.collectMs)),
+  publishMs: median(runDetails.map((run) => run.publishMs ?? 0)),
+  packSyncMs: median(runDetails.map((run) => run.packSyncs.reduce((sum, entry) => sum + entry.ms, 0))),
 }
-const serial = summarise('serial')
-const overlap = summarise('overlap')
 
-// Model projection from the serial runs' own constants: E_i = per-turn wall
-// time, C_i = per-pack sync cost; the projection is what overlap can hide:
-// turns 1..N-1 under the next turn's execution, the last turn's pack under
-// collect() (publish() drains whatever is still in flight)
-const projections = byMode('serial').map((run) => {
-  let projection = 0
-  for (let index = 0; index < run.turnMs.length - 1; index += 1) {
-    const packMs = run.packSyncs.find((entry) => entry.turn === index + 1)?.ms ?? 0
-    projection += Math.min(packMs, run.turnMs[index + 1])
-  }
-  projection += Math.min(run.packSyncs.at(-1)?.ms ?? 0, run.collectMs)
-  return projection
-})
-const projectedSavingMs = median(projections)
-const observedSavingMs = serial.runMs - overlap.runMs
-
-console.log('── measured constants (median, ms)')
-console.log(`   execution ΣE            serial ${round(serial.executionMs)}  overlap ${round(overlap.executionMs)}`)
-console.log(`   pack sync ΣC (publish)  serial ${round(serial.packSyncMs)}`)
-console.log(`   pack sync ΣC (hidden)   overlap ${round(overlap.backgroundPackMs)}  (drained at publish: ${round(overlap.drainMs)})`)
-console.log('── wall time (median, ms)')
-console.log(`   prepare                 serial ${round(serial.prepareMs)}  overlap ${round(overlap.prepareMs)}`)
-console.log(`   run total (prepare->publish) serial ${round(serial.runMs)}  overlap ${round(overlap.runMs)}`)
-console.log('── ADR-0010 model check')
-console.log(`   projected saving  Σ min(Ci, Ei+1) = ${round(projectedSavingMs)} ms`)
-console.log(`   observed saving  T_serial - T_overlap = ${round(observedSavingMs)} ms`)
-console.log(`   fidelity          observed/projected = ${projectedSavingMs > 0 ? Math.round((observedSavingMs / projectedSavingMs) * 100) : 'n/a'}%`)
-console.log(`   sandbox occupancy reduction = ${serial.runMs > 0 ? ((observedSavingMs / serial.runMs) * 100).toFixed(1) : 'n/a'}% of the run\n`)
+console.log('── critical path (median, ms)')
+console.log(`   prepare                ${round(summary.prepareMs)}`)
+console.log(`   boot                   ${round(summary.bootMs)}`)
+console.log(`   execution ΣE           ${round(summary.executionMs)}  (${runDetails.at(-1)?.turnMs.map(round).join(' + ')} per turn)`)
+console.log(`   collect                ${round(summary.collectMs)}`)
+console.log(`   publish                ${round(summary.publishMs)}  (incl. pack sync ΣC ${round(summary.packSyncMs)} — on the critical path per ADR-0011)`)
+console.log(`   run total              ${round(summary.runMs)}`)
+console.log('── ADR-0011 context: a background-sync design could hide up to Σ min(Ci, Ei+1) of the')
+console.log('   pack-sync cost under execution; ADR-0010 measured 48–85% fidelity of that projection.')
+console.log('   This benchmark tracks the accepted occupancy cost of the simpler design.\n')
 
 const report = {
   timestamp: new Date().toISOString(),
   node: process.version,
   codex: 'codex-cli 0.149.1',
   workload: { turns: TURNS, payloadMb: PAYLOAD_MB, seedMb: SEED_MB, modelDelayMs: DELAY_MS, measuredRuns: MEASURED_RUNS },
-  serial,
-  overlap,
-  model: { projectedSavingMs: round(projectedSavingMs), observedSavingMs: round(observedSavingMs) },
+  summary,
   runs: runDetails.map((run) => ({
-    mode: run.mode,
     runMs: round(run.runMs),
     turnMs: run.turnMs.map(round),
     packSyncs: run.packSyncs.map((entry) => ({ ...entry, ms: round(entry.ms) })),
     prepareMs: round(run.prepareMs),
+    bootMs: round(run.bootMs),
     collectMs: round(run.collectMs),
-    drainMs: round(run.drainMs),
+    publishMs: round(run.publishMs ?? 0),
   })),
 }
 const resultsDir = join(fileURLToPath(new URL('.', import.meta.url)), 'results')

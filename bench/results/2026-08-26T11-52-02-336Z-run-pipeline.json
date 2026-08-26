@@ -1,0 +1,312 @@
+{
+  "timestamp": "2026-08-26T11:52:02.336Z",
+  "node": "v24.1.0",
+  "codex": "codex-cli 0.149.1",
+  "workload": {
+    "turns": 5,
+    "payloadMb": 8,
+    "seedMb": 4,
+    "modelDelayMs": 600,
+    "measuredRuns": 3
+  },
+  "serial": {
+    "runMs": 18494,
+    "executionMs": 12565,
+    "packSyncMs": 2301,
+    "backgroundPackMs": 0,
+    "prepareMs": 455,
+    "collectMs": 622,
+    "drainMs": 0
+  },
+  "overlap": {
+    "runMs": 15485,
+    "executionMs": 11647,
+    "packSyncMs": 2601,
+    "backgroundPackMs": 2601,
+    "prepareMs": 455,
+    "collectMs": 699,
+    "drainMs": 0
+  },
+  "model": {
+    "projectedSavingMs": 2301,
+    "observedSavingMs": 3009
+  },
+  "runs": [
+    {
+      "mode": "overlap",
+      "runMs": 15364,
+      "turnMs": [
+        2355,
+        2329,
+        2236,
+        2218,
+        2394
+      ],
+      "packSyncs": [
+        {
+          "turn": 1,
+          "from": null,
+          "ms": 832,
+          "phase": "background"
+        },
+        {
+          "turn": 2,
+          "from": 1,
+          "ms": 433,
+          "phase": "background"
+        },
+        {
+          "turn": 3,
+          "from": 2,
+          "ms": 403,
+          "phase": "background"
+        },
+        {
+          "turn": 4,
+          "from": 3,
+          "ms": 492,
+          "phase": "background"
+        },
+        {
+          "turn": 5,
+          "from": 4,
+          "ms": 441,
+          "phase": "background"
+        }
+      ],
+      "prepareMs": 430,
+      "collectMs": 699,
+      "drainMs": 0
+    },
+    {
+      "mode": "serial",
+      "runMs": 18494,
+      "turnMs": [
+        2368,
+        2170,
+        2163,
+        2167,
+        3697
+      ],
+      "packSyncs": [
+        {
+          "turn": 1,
+          "from": null,
+          "ms": 624,
+          "phase": "publish"
+        },
+        {
+          "turn": 2,
+          "from": 1,
+          "ms": 388,
+          "phase": "publish"
+        },
+        {
+          "turn": 3,
+          "from": 2,
+          "ms": 416,
+          "phase": "publish"
+        },
+        {
+          "turn": 4,
+          "from": 3,
+          "ms": 388,
+          "phase": "publish"
+        },
+        {
+          "turn": 5,
+          "from": 4,
+          "ms": 410,
+          "phase": "publish"
+        }
+      ],
+      "prepareMs": 466,
+      "collectMs": 655,
+      "drainMs": 0
+    },
+    {
+      "mode": "serial",
+      "runMs": 19271,
+      "turnMs": [
+        2894,
+        3907,
+        2167,
+        2138,
+        2160
+      ],
+      "packSyncs": [
+        {
+          "turn": 1,
+          "from": null,
+          "ms": 660,
+          "phase": "publish"
+        },
+        {
+          "turn": 2,
+          "from": 1,
+          "ms": 422,
+          "phase": "publish"
+        },
+        {
+          "turn": 3,
+          "from": 2,
+          "ms": 405,
+          "phase": "publish"
+        },
+        {
+          "turn": 4,
+          "from": 3,
+          "ms": 402,
+          "phase": "publish"
+        },
+        {
+          "turn": 5,
+          "from": 4,
+          "ms": 412,
+          "phase": "publish"
+        }
+      ],
+      "prepareMs": 451,
+      "collectMs": 622,
+      "drainMs": 0
+    },
+    {
+      "mode": "overlap",
+      "runMs": 15485,
+      "turnMs": [
+        2376,
+        2445,
+        2361,
+        2217,
+        2248
+      ],
+      "packSyncs": [
+        {
+          "turn": 1,
+          "from": null,
+          "ms": 813,
+          "phase": "background"
+        },
+        {
+          "turn": 2,
+          "from": 1,
+          "ms": 441,
+          "phase": "background"
+        },
+        {
+          "turn": 3,
+          "from": 2,
+          "ms": 441,
+          "phase": "background"
+        },
+        {
+          "turn": 4,
+          "from": 3,
+          "ms": 443,
+          "phase": "background"
+        },
+        {
+          "turn": 5,
+          "from": 4,
+          "ms": 420,
+          "phase": "background"
+        }
+      ],
+      "prepareMs": 481,
+      "collectMs": 750,
+      "drainMs": 0
+    },
+    {
+      "mode": "overlap",
+      "runMs": 16446,
+      "turnMs": [
+        2266,
+        4018,
+        2208,
+        2174,
+        2186
+      ],
+      "packSyncs": [
+        {
+          "turn": 1,
+          "from": null,
+          "ms": 1000,
+          "phase": "background"
+        },
+        {
+          "turn": 2,
+          "from": 1,
+          "ms": 472,
+          "phase": "background"
+        },
+        {
+          "turn": 3,
+          "from": 2,
+          "ms": 421,
+          "phase": "background"
+        },
+        {
+          "turn": 4,
+          "from": 3,
+          "ms": 433,
+          "phase": "background"
+        },
+        {
+          "turn": 5,
+          "from": 4,
+          "ms": 403,
+          "phase": "background"
+        }
+      ],
+      "prepareMs": 455,
+      "collectMs": 608,
+      "drainMs": 0
+    },
+    {
+      "mode": "serial",
+      "runMs": 17330,
+      "turnMs": [
+        2267,
+        2591,
+        2364,
+        2105,
+        2113
+      ],
+      "packSyncs": [
+        {
+          "turn": 1,
+          "from": null,
+          "ms": 663,
+          "phase": "publish"
+        },
+        {
+          "turn": 2,
+          "from": 1,
+          "ms": 422,
+          "phase": "publish"
+        },
+        {
+          "turn": 3,
+          "from": 2,
+          "ms": 416,
+          "phase": "publish"
+        },
+        {
+          "turn": 4,
+          "from": 3,
+          "ms": 401,
+          "phase": "publish"
+        },
+        {
+          "turn": 5,
+          "from": 4,
+          "ms": 418,
+          "phase": "publish"
+        }
+      ],
+      "prepareMs": 455,
+      "collectMs": 598,
+      "drainMs": 0
+    }
+  ]
+}

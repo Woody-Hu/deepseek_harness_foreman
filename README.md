@@ -27,11 +27,12 @@ code changes.
   incremental change packs ("full first pack + incremental pack chain"). A skip-list-style
   tiered retention policy balances pack count against pack size, and periodic rebaselines
   bound the restore chain length. See [docs/checkpoint-design.md](docs/checkpoint-design.md).
-- **Overlap scheduling (ADR-0010)** — checkpoint packs are built and uploaded in the
-  background while the next turn executes; workspace packs, session archives, and publish
-  artifacts transfer concurrently. Measured on the real codex channel (5 turns × 8 MiB):
-  2 065 ms less sandbox occupancy per run (12.1%), matching the critical-path projection
-  (85% fidelity). See [bench/run-pipeline.bench.js](bench/run-pipeline.bench.js).
+- **Overlap scheduling (ADR-0010, simplified by ADR-0011)** — independent transfers
+  overlap at session boundaries: workspace packs and the session archive download in
+  parallel during `prepare()`, publish artifacts upload in parallel during `publish()`,
+  and checkpoint packs build/upload inside `publish()`'s single retention pass (no
+  per-turn background sync, no drain state). See
+  [bench/run-pipeline.bench.js](bench/run-pipeline.bench.js).
 - **Secret interception, three layers** — path exclusion (`.env` and friends never packaged),
   content masking (`[REDACTED]` replaces secret values in packaged files and forwarded event
   streams), and git pre-commit scanning (secret-looking files are unstaged — they stay out of
@@ -64,9 +65,14 @@ accepted and map to `dsh-sdk` / `dsh-web`.
 | `dsh-web` | dsh web apiproxy (HTTP + WebSocket) | DeepSeek Harness | native (cold persisted sessions) | full support |
 | `codex` | JSON-RPC 2.0-lite over stdio JSONL | Codex Harness app-server | via `thread/resume` (verified against codex-cli 0.149.1) | planned |
 
-All channels share one `Foreman` orchestrator; the composition config (`cordis.yml` /
-`web-patch.yml` / `foreman.config.json`) is owned by the cloud and delivered through object
-storage.
+All channels share one `Foreman` orchestrator and are selected **config-only** through the
+channel registry (ADR-0012, `src/channels/registry.js`): each entry declares its
+capabilities (`hitl`, `compositionFile`, `sessionRoot`) and a factory, and the
+orchestrator never branches on channel identity. The composition config
+(`cordis.yml` / `web-patch.yml` / `foreman.config.json`) is owned by the cloud and
+delivered through object storage. `test/e2e/composition.e2e.js` is the acceptance test:
+different harnesses start with zero channel constructor options — the selection comes
+entirely from the config file.
 
 ## Repository layout
 
@@ -81,10 +87,12 @@ solution/
       workspace.js        manifests, packaging, archives, fs-change extraction
       redact.js           secret redaction utilities (text/buffer/json)
     channels/
+      registry.js         channel registry (ADR-0012): ids, capabilities, factories
       sdk-channel.js      dsh SDK JSON-RPC driver (stdio)
       web-channel.js      dsh web driver (HTTP + mux WebSocket)
       codex-channel.js    Codex Harness app-server driver (JSON-RPC over stdio)
     events/
+      gateway.js          SSE gateway (GET /events, replay, Last-Event-ID resume)
       formats.js          outbound event formatter façade (delegates to the registry)
       protocols/          protocol adapter registry + built-in dialects
         registry.js         id/alias resolution; external adapters register here
@@ -97,15 +105,16 @@ solution/
       trace-shipper.js    async trace shipping with retry + failure isolation
     storage/
       snapshot-sink.js    snapshot storage abstraction (credentials via env)
-    config.js             runner config file loader (protocol / delivery selection)
+    config.js             runner config file loader (protocol / delivery / harness.channel)
   plugins/
     resume-adapter.mjs    reroutes persisted sessionIds from agents.create to agents.resume
     telemetry-enrich.mjs  deployment-side telemetry attribute pipeline (rule table)
   bench/
     protocol.bench.js     protocol pipeline benchmark (real loopback HTTP, no mocks)
-    run-pipeline.bench.js overlap-scheduling A/B benchmark on a real run (ADR-0010)
+    run-pipeline.bench.js run-lifecycle critical-path benchmark (ADR-0010/ADR-0011)
   test/
-    unit.test.js          unit tests (retention, redaction, formats, packs, bus, sink)
+    unit.test.js          unit tests (retention, redaction, formats, packs, bus, sink, git)
+    registry.test.js      channel registry + config validation tests (ADR-0012)
     protocols.test.js     golden-transcript conformance tests for every adapter
     gateway-wire.test.js  real-HTTP wire tests for the SSE gateway
     inbound-parse.test.js parse-direction conformance tests — proposed
@@ -128,12 +137,13 @@ Requirements: Node.js >= 22.19, a built harness repository, and the `git` binary
 pnpm test                 # unit + protocol conformance + wire tests
 pnpm run bench            # protocol pipeline benchmark (real loopback HTTP)
 pnpm run bench:quick      # same, smaller workload
-pnpm run bench:pipeline   # overlap-scheduling A/B benchmark (ADR-0010; real codex channel)
+pnpm run bench:pipeline   # run-lifecycle critical-path benchmark (ADR-0010/0011; real codex channel)
 pnpm test:e2e:basic       # cold start + session resume (dsh-sdk channel)
 pnpm test:e2e:web         # HITL approvals + crash/dangling-approval recovery (dsh-web channel)
 pnpm test:e2e:cloud       # trace shipping, snapshot sink, event bus, format adaptation
 pnpm test:e2e:checkpoint  # 7-round incremental checkpoint chain + retention + rebase
 pnpm test:e2e:codex       # cold start + cross-sandbox resume (codex channel)
+pnpm test:e2e:composition # config-only channel switching across harnesses (ADR-0012)
 ```
 
 All tests are keyless: they run against in-process mocks of the model endpoint, the control
@@ -182,7 +192,11 @@ The inbound harness channel is selected per run via configuration (ADR-0005):
 
 `harness.channel` accepts `'dsh-sdk'` (default, DeepSeek Harness SDK), `'dsh-web'`
 (DeepSeek Harness web apiproxy), or `'codex'` (Codex Harness app-server); legacy aliases
-`'stdio'` / `'web'` remain accepted (ADR-0009).
+`'stdio'` / `'web'` remain accepted (ADR-0009). Precedence: constructor option > config
+file > default. The `harness.codex` section (binary, model, provider, approval policy,
+sandbox, timeout) wires the codex channel from the same config file — only the API key
+is env-injected via the constructor; secrets never live in the config file. A typo'd
+channel id fails loud at config load.
 
 ### Driving the runner programmatically
 
@@ -254,6 +268,10 @@ a matter of writing a single module.
     (`dsh-sdk` / `dsh-web` / `codex`).
   - [ADR-0010](docs/adr/0010-overlap-scheduling.md) — overlap scheduling for run-lifecycle
     I/O, with the critical-path model and measured verification.
+  - [ADR-0011](docs/adr/0011-simplified-overlap-scheduling.md) — simplified overlap
+    scheduling (session-boundary concurrency; pack sync inside `publish()`).
+  - [ADR-0012](docs/adr/0012-channel-registry.md) — channel registry and config-only
+    composition.
 
 ## License
 

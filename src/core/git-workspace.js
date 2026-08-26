@@ -40,12 +40,18 @@ const SCAN_OVERLAP = 4096
  * @param {string[]} [options.secretValues] known secret values (exact substring match; same source as env injection)
  * @param {Array<{name: string, pattern: RegExp}>} [options.secretPatterns] secret shapes
  * @param {number} [options.maxScanBytes] streaming secret-scan chunk size (files of any size are scanned in overlapping chunks)
+ * @param {string} [options.branch] initial branch name (default 'main')
+ * @param {{name: string, email: string}} [options.identity] local committer identity (default 'Foreman <foreman@localhost>')
  */
 export class GitWorkspace {
   constructor(options) {
+    // undefined values must not override the defaults (callers pass sparse option objects)
+    const provided = Object.fromEntries(Object.entries(options).filter(([, value]) => value !== undefined))
     this.options = {
       maxScanBytes: 2_000_000,
-      ...options,
+      branch: 'main',
+      identity: { name: 'foreman', email: 'foreman@localhost' },
+      ...provided,
       secretValues: options.secretValues ?? [],
       secretPatterns: options.secretPatterns ?? DEFAULT_SECRET_PATTERNS,
     }
@@ -101,12 +107,17 @@ export class GitWorkspace {
     }
   }
 
-  /** Initialize the repository (idempotent): git init -b main + local identity (commits work without global git config). */
+  /** Initialize the repository (idempotent): git init -b <branch> + local identity (commits work without global git config). */
   async ensureRepo() {
-    await this.git(['init', '-q', '-b', 'main'])
-    await this.git(['config', 'user.email', 'foreman@localhost'])
-    await this.git(['config', 'user.name', 'foreman'])
+    await this.git(['init', '-q', '-b', this.options.branch])
+    await this.git(['config', 'user.email', this.options.identity.email])
+    await this.git(['config', 'user.name', this.options.identity.name])
     await this.git(['config', 'commit.gpgsign', 'false'])
+  }
+
+  /** Current HEAD commit oid ('' when no commit exists yet). */
+  async headOid() {
+    return (await this.git(['rev-parse', 'HEAD']).catch(() => '')).trim()
   }
 
   /**

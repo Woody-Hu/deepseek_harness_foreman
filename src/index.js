@@ -6,9 +6,12 @@
  * forwards events/traces to the cloud, intercepts secrets, and publishes the
  * run's artifacts back to storage. See README.md for the architecture.
  */
-export { Foreman, SseGateway, makeWorkdir } from './foreman.js'
+export { Foreman, makeWorkdir } from './foreman.js'
+export { SseGateway } from './events/gateway.js'
 export { SdkChannel } from './channels/sdk-channel.js'
 export { WebChannel } from './channels/web-channel.js'
+export { CodexChannel } from './channels/codex-channel.js'
+export { CHANNELS, resolveChannelId, channelEntry, createChannel } from './channels/registry.js'
 export { CheckpointKeeper, buildChangePack, applyChangePack, extractChangePack, packKey, INDEX_KEY } from './core/checkpoint.js'
 export { GitWorkspace } from './core/git-workspace.js'
 export {

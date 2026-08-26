@@ -1,0 +1,100 @@
+{
+  "timestamp": "2026-08-26T11:48:30.767Z",
+  "node": "v24.1.0",
+  "codex": "codex-cli 0.149.1",
+  "workload": {
+    "turns": 3,
+    "payloadMb": 2,
+    "seedMb": 1,
+    "modelDelayMs": 300,
+    "measuredRuns": 1
+  },
+  "serial": {
+    "runMs": 5937,
+    "executionMs": 3798,
+    "packSyncMs": 532,
+    "backgroundPackMs": 0,
+    "prepareMs": 257,
+    "collectMs": 205,
+    "drainMs": 0
+  },
+  "overlap": {
+    "runMs": 5683,
+    "executionMs": 4024,
+    "packSyncMs": 761,
+    "backgroundPackMs": 761,
+    "prepareMs": 237,
+    "collectMs": 251,
+    "drainMs": 0
+  },
+  "model": {
+    "projectedSavingMs": 532,
+    "observedSavingMs": 254
+  },
+  "runs": [
+    {
+      "mode": "serial",
+      "runMs": 5937,
+      "turnMs": [
+        1270,
+        1286,
+        1242
+      ],
+      "packSyncs": [
+        {
+          "turn": 1,
+          "from": null,
+          "ms": 235,
+          "phase": "publish"
+        },
+        {
+          "turn": 2,
+          "from": 1,
+          "ms": 152,
+          "phase": "publish"
+        },
+        {
+          "turn": 3,
+          "from": 2,
+          "ms": 145,
+          "phase": "publish"
+        }
+      ],
+      "prepareMs": 257,
+      "collectMs": 205,
+      "drainMs": 0
+    },
+    {
+      "mode": "overlap",
+      "runMs": 5683,
+      "turnMs": [
+        1332,
+        1353,
+        1339
+      ],
+      "packSyncs": [
+        {
+          "turn": 1,
+          "from": null,
+          "ms": 340,
+          "phase": "background"
+        },
+        {
+          "turn": 2,
+          "from": 1,
+          "ms": 254,
+          "phase": "background"
+        },
+        {
+          "turn": 3,
+          "from": 2,
+          "ms": 167,
+          "phase": "background"
+        }
+      ],
+      "prepareMs": 237,
+      "collectMs": 251,
+      "drainMs": 0
+    }
+  ]
+}

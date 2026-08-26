@@ -21,6 +21,7 @@
  *   }
  */
 import { readFile } from 'node:fs/promises'
+import { resolveChannelId } from './channels/registry.js'
 
 const KNOWN_TOP_KEYS = new Set(['events', 'harness'])
 const KNOWN_EVENTS_KEYS = new Set(['protocol', 'delivery', 'model', 'bus'])
@@ -28,24 +29,6 @@ const KNOWN_HARNESS_KEYS = new Set(['channel', 'codex'])
 const KNOWN_CODEX_KEYS = new Set(['binary', 'args', 'model', 'provider', 'approvalPolicy', 'sandbox', 'timeoutMs'])
 const KNOWN_PROVIDER_KEYS = new Set(['name', 'baseUrl', 'envKey'])
 const CODEX_SANDBOX_MODES = new Set(['read-only', 'workspace-write', 'danger-full-access'])
-
-/** Canonical channel ids (ADR-0009). */
-export const CHANNELS = ['dsh-sdk', 'dsh-web', 'codex']
-
-/** Legacy channel ids accepted as aliases (deprecated). */
-const CHANNEL_ALIASES = { stdio: 'dsh-sdk', web: 'dsh-web' }
-
-/**
- * Resolve a channel selection to its canonical id (ADR-0009).
- * @throws {Error} unknown channel id (with the accepted values listed)
- */
-export function resolveChannelId(id) {
-  const canonical = CHANNEL_ALIASES[id] ?? id
-  if (!CHANNELS.includes(canonical)) {
-    throw new Error(`foreman: unknown channel '${String(id)}' (accepted: ${CHANNELS.join(', ')}; legacy aliases: ${Object.keys(CHANNEL_ALIASES).join(', ')})`)
-  }
-  return canonical
-}
 
 /** Resolve the config file path: explicit option > FOREMAN_CONFIG env > none. */
 export function resolveConfigPath(options = {}) {

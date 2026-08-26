@@ -16,7 +16,9 @@ edited in place after acceptance.
 | [0007](0007-inbound-protocol-adaptation.md) | Inbound protocol adaptation (generalized parse direction) | Proposed |
 | [0008](0008-harness-protocol-testing-and-benchmarks.md) | Independent testing and benchmark strategy for harness protocols | Proposed |
 | [0009](0009-channel-naming.md) | Harness-scoped channel naming (`dsh-sdk` / `dsh-web` / `codex`) | Accepted |
-| [0010](0010-overlap-scheduling.md) | Overlap scheduling for run-lifecycle I/O | Accepted |
+| [0010](0010-overlap-scheduling.md) | Overlap scheduling for run-lifecycle I/O | Accepted (3a superseded by ADR-0011) |
+| [0011](0011-simplified-overlap-scheduling.md) | Simplified overlap scheduling | Accepted |
+| [0012](0012-channel-registry.md) | Channel registry and config-only composition | Accepted |
 
 ## Process
 
