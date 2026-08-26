@@ -20,7 +20,8 @@ without a test.
 
 - `prepare()` — fetch run composition (config) + workspace snapshot from object storage,
   decompress, place files, restore session logs for cross-sandbox session resume.
-- `start()` — launch dsh (stdio or web channel), open the outbound SSE gateway.
+- `start()` — launch dsh (`dsh-sdk` / `dsh-web`) or codex (`codex`), open the outbound
+  SSE gateway.
 - `prompt()` — drive a user turn; streaming events published to the gateway in real time.
 - `collect()` — final answer, change sets, session logs.
 - `shutdown()` / `kill()` — graceful vs. simulated-crash paths (dangling HITL approvals
@@ -28,13 +29,26 @@ without a test.
 - `publish()` — redact, package (compress), upload the workspace snapshot, emit the
   sandbox-reclaimable notification.
 
+### Overlap scheduling (ADR-0010)
+
+- Per-turn background checkpoint sync: each turn's pack is built and uploaded while the
+  next turn executes; `publish()` drains the chain before the retention sync (no reclaim
+  with a sync in flight; the index is written only after the drain).
+- Concurrent transfers: workspace packs and the session archive download in parallel
+  during `prepare()`; the publish artifact batch uploads in parallel.
+- Measured (`bench/run-pipeline.bench.js`, real codex channel, 5 turns × 8 MiB):
+  2 065 ms saved per run (12.1% sandbox occupancy), 85% of the critical-path
+  projection — see ADR-0010's verification section.
+
 ### Channels
+
+Canonical ids per ADR-0009 (legacy aliases `stdio` / `web` accepted):
 
 | Channel | State | Notes |
 |---|---|---|
-| `stdio` | implemented | dsh SDK JSON-RPC over NDJSON; session resume via the bundled resume-adapter plugin |
-| `web` | implemented | dsh web apiproxy (HTTP + WebSocket); native persisted sessions; full HITL |
-| `codex` | **implemented** | Codex Harness app-server JSON-RPC over stdio; `CodexChannel` in `src/channels/codex-channel.js` |
+| `dsh-sdk` | implemented | dsh SDK JSON-RPC over NDJSON stdio; session resume via the bundled resume-adapter plugin |
+| `dsh-web` | implemented | dsh web apiproxy (HTTP + WebSocket); native persisted sessions; full HITL |
+| `codex` | **implemented** | Codex Harness app-server JSON-RPC over stdio; `CodexChannel` in `src/channels/codex-channel.js`; cross-sandbox resume via `thread/resume` (verified against codex-cli 0.149.1) |
 
 ### Outbound event layer (generalized protocol adaptation, ADR-0001)
 
@@ -59,12 +73,15 @@ without a test.
 ### Workspace & checkpointing
 
 - Local git workspace with pre-commit secret interception (secret-looking files never enter
-  history, therefore never enter packs).
+  history, therefore never enter packs); the scan streams files of any size in overlapping
+  chunks — large files commit, secrets spanning chunk boundaries are still caught.
 - Change packs: full first pack + incremental pack chain; skip-list retention
   (dense near, exponentially sparse far); periodic rebaseline bounds restore chain length;
   merged cross-round packs yield identical trees to stepwise application.
 - Secret redaction: path exclusion, content masking (`[REDACTED]`) in packaged files and
   forwarded event streams; env-injected credentials only, never on disk.
+- Session archives exclude harness transient scratch (`CODEX_HOME/.tmp`) — the harness is
+  still alive at publish time and its in-flight plugin clones would tear the archive.
 
 ### Observability & storage
 
@@ -80,12 +97,19 @@ without a test.
   subscriber; asserts framing, ids, `Last-Event-ID` resumption, and close semantics on the
   actual wire bytes, not on formatter return values.
 - **E2E scenarios** — basic resume, web HITL + crash recovery, cloud (trace/sink/bus/
-  adaptation), 7-round checkpoint chain.
+  adaptation), 7-round checkpoint chain, codex channel (cold start + cross-sandbox
+  `thread/resume` + tool execution + checkpoint restore, driven by the real codex binary
+  against a scripted Responses-API endpoint; skips when the binary is absent).
 - **Protocol pipeline benchmark** (`npm run bench`) — formatter-only throughput plus
   end-to-end throughput/latency (p50/p95/p99) per protocol over real loopback HTTP, driven
   by the same golden transcripts; results written to `bench/results/`. Integrity gate: the
   benchmark refuses to report numbers unless every emitted event is received (no benchmarking
   a broken pipeline, no derived numbers).
+- **Run-pipeline benchmark** (`npm run bench:pipeline`, ADR-0010) — A/B overlap on/off on
+  the real codex channel with real git/tar/uploads and a scripted model latency; integrity
+  gates: payload presence, pack-sync phase placement, and bit-for-bit restore from the
+  published index; verifies the critical-path performance model against the observed
+  saving.
 
 Reference figures (this sandbox, `--quick`, median of 3 runs — indicative, not a contract):
 
@@ -97,8 +121,9 @@ Reference figures (this sandbox, `--quick`, median of 3 runs — indicative, not
 
 ### Documentation
 
-- ADRs 0001–0008 (adapter layer, config file, codex dialect, hermetic testing, Codex channel,
-  Anthropic Messages, inbound adaptation, harness protocol testing).
+- ADRs 0001–0010 (adapter layer, config file, codex dialect, hermetic testing, Codex channel,
+  Anthropic Messages, inbound adaptation, harness protocol testing, channel naming, overlap
+  scheduling).
 - Design docs: SSE protocol adapter, Codex channel, Anthropic Messages protocol.
 - Architecture + checkpoint design docs; this roadmap.
 
@@ -120,8 +145,10 @@ Deliberate limits of the current implementation; each maps to a roadmap item bel
    dialects are not yet covered.
 4. **SSE gateway is single-node, in-memory.** Replay buffer lives in the process; a gateway
    restart loses resumability (events are still durable via trace/event-bus paths).
-5. **Benchmark covers the event pipeline only.** No benchmarks yet for snapshot
-   compress/upload, pack application, or full run latency.
+5. **Overlap scheduling is single-session only.** Overlaps happen within one run's
+   lifecycle (pack sync during execution, concurrent transfers). There is no
+   cross-session scheduler yet — no pre-restoring sandbox B's workspace while sandbox A
+   executes (revisit when sandboxes are pooled; ADR-0010 option 2).
 6. **Adapters are output-only modules.** There is no inbound parser (wire → internal frame);
    a "full duplex" protocol adapter (needed for a transparent proxy mode) does not exist.
    ADR-0007 proposes the generalized parse direction.
@@ -151,6 +178,16 @@ Deliberate limits of the current implementation; each maps to a roadmap item bel
 - [x] **`CodexChannel` implementation** (ADR-0005) — new channel class for Codex Harness
       app-server JSON-RPC over stdio, with initialization handshake, thread/turn lifecycle,
       and internal frame mapping (`src/channels/codex-channel.js`).
+- [x] **Codex channel verified end-to-end** — e2e scenario (real codex-cli 0.149.1 binary,
+      scripted Responses endpoint): cold start, tool execution, cross-sandbox
+      `thread/resume`, checkpoint chain restore, publish — `pnpm test:e2e:codex` (26/26).
+- [x] **Harness-scoped channel naming** (ADR-0009) — `dsh-sdk` / `dsh-web` / `codex`
+      canonical ids; legacy `stdio` / `web` aliases accepted; config surface validated
+      against the canonical list.
+- [x] **Overlap scheduling** (ADR-0010) — per-turn background checkpoint sync + concurrent
+      prepare/publish transfers; measured on the real codex channel (5 turns × 8 MiB):
+      2 065 ms saved per run (12.1% sandbox occupancy), 85% of the projected critical-path
+      saving — `bench/run-pipeline.bench.js`.
 - [x] **`anthropic-messages` adapter** (ADR-0006) — registered adapter, golden-transcript
       conformance tests, wire-level tests, and benchmark integration
       (`src/events/protocols/anthropic-messages.js`).
@@ -162,9 +199,8 @@ Deliberate limits of the current implementation; each maps to a roadmap item bel
 - [ ] **Inbound protocol adaptation** (ADR-0007) — generalize the adapter contract with a
       `parse(wireChunk) → internal frames` direction, starting with `openai-chat` and
       `anthropic-messages`, so the gateway can accept protocol-native prompt submissions.
-- [ ] **Benchmark coverage for the run pipeline** — snapshot fetch/decompress/place,
-      pack build/apply, compress/upload, reclaim-notification latency; same hermetic
-      rules (real work, real timers, integrity gates).
+- [ ] **Codex channel HITL** — approval requests are not yet forwarded as SSE frames with
+      `POST /hitl` decisions (approval policy is currently set to a fixed value per run).
 - [ ] **Gateway authentication** — per-subscriber token/auth on `GET /events` and
       `POST /hitl`, credentials injected via env like all other secrets.
 
@@ -223,4 +259,4 @@ Deliberate limits of the current implementation; each maps to a roadmap item bel
 
 ---
 
-*Last updated: 2026-08-25*
+*Last updated: 2026-08-26*

@@ -22,7 +22,7 @@
  * Dependency: the git binary must exist in the sandbox image (deployment requirement).
  */
 import { execFile } from 'node:child_process'
-import { readFile } from 'node:fs/promises'
+import { open } from 'node:fs/promises'
 import { join } from 'node:path'
 
 /** Default secret shapes: OpenAI/DeepSeek-style keys, AWS-style access keys. */
@@ -31,12 +31,15 @@ export const DEFAULT_SECRET_PATTERNS = [
   { name: 'aws-access-key', pattern: /AKIA[0-9A-Z]{16}/ },
 ]
 
+/** Chunk carry-over (chars) for the streaming secret scan — exceeds every pattern's match length. */
+const SCAN_OVERLAP = 4096
+
 /**
  * @param {object} options
  * @param {string} options.cwd workspace directory (git repository root)
  * @param {string[]} [options.secretValues] known secret values (exact substring match; same source as env injection)
  * @param {Array<{name: string, pattern: RegExp}>} [options.secretPatterns] secret shapes
- * @param {number} [options.maxScanBytes] per-file scan ceiling (oversized files are skipped and recorded as violations)
+ * @param {number} [options.maxScanBytes] streaming secret-scan chunk size (files of any size are scanned in overlapping chunks)
  */
 export class GitWorkspace {
   constructor(options) {
@@ -143,27 +146,52 @@ export class GitWorkspace {
     return out.split('\n').filter((line) => line.length > 0)
   }
 
-  /** Scan staged content: known exact values + shape regexes; hits are aggregated per file (one violation entry per file). */
+  /**
+   * Scan staged content: known exact values + shape regexes; hits are
+   * aggregated per file (one violation entry per file). Files larger than
+   * maxScanBytes are scanned in overlapping chunks — a secret spanning a
+   * chunk boundary is still caught, and large files are never silently
+   * dropped from history (an unstaged file would vanish from every
+   * checkpoint pack and from restores).
+   */
   async scanStaged() {
     const violations = []
     for (const file of await this.stagedFiles()) {
-      const content = await readFile(join(this.options.cwd, file)).catch(() => undefined)
-      if (content === undefined) continue // deleted paths / unreadable files are skipped; readable new files are always scanned
-      if (content.length > this.options.maxScanBytes) {
-        violations.push({ file, rules: ['oversize'] })
-        continue
-      }
-      const text = content.toString('utf8')
-      const rules = []
-      for (const value of this.options.secretValues) {
-        if (value.length > 0 && text.includes(value)) rules.push('known-secret')
-      }
-      for (const { name, pattern } of this.options.secretPatterns) {
-        if (pattern.test(text)) rules.push(`pattern:${name}`)
-      }
-      if (rules.length > 0) violations.push({ file, rules })
+      const rules = await this.#scanFile(file)
+      if (rules !== null && rules.length > 0) violations.push({ file, rules })
     }
     return violations
+  }
+
+  /**
+   * Scan one staged file in maxScanBytes chunks with SCAN_OVERLAP bytes of
+   * carry-over (patterns are ASCII-shaped, so a partial multi-byte character
+   * at a chunk edge cannot split a match). Returns null when the file is
+   * unreadable (deleted paths are skipped); the rule list is deduplicated.
+   */
+  async #scanFile(file) {
+    const handle = await open(join(this.options.cwd, file)).catch(() => null)
+    if (handle === null) return null
+    const rules = new Set()
+    const buffer = Buffer.allocUnsafe(this.options.maxScanBytes)
+    let carry = ''
+    try {
+      for (;;) {
+        const { bytesRead } = await handle.read(buffer, 0, buffer.length, null)
+        if (bytesRead === 0) break
+        const text = carry + buffer.subarray(0, bytesRead).toString('utf8')
+        for (const value of this.options.secretValues) {
+          if (value.length > 0 && text.includes(value)) rules.add('known-secret')
+        }
+        for (const { name, pattern } of this.options.secretPatterns) {
+          if (pattern.test(text)) rules.add(`pattern:${name}`)
+        }
+        carry = text.slice(Math.max(0, text.length - SCAN_OVERLAP))
+      }
+    } finally {
+      await handle.close()
+    }
+    return [...rules]
   }
 
   /** Changes since the baseline (authoritative change set): [{path, status}] (A/M/D/R). */

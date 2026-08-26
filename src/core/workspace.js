@@ -142,8 +142,17 @@ export async function extractArchive(archivePath, destDir) {
   await execFileAsync('tar', ['-xzf', archivePath, '-C', destDir])
 }
 
-/** Archive a directory into tar.gz (no redaction; for trusted data such as seeds and session logs). */
-export async function archiveDirectory(dir, outPath) {
-  await execFileAsync('tar', ['-czf', outPath, '-C', dir, '.'])
+/**
+ * tar.gz a directory (no redaction; for trusted data such as seeds and session
+ * logs). `exclude` entries are tar --exclude patterns matched against the
+ * archived names ('./'-prefixed); an excluded directory is pruned with its
+ * contents (used to skip harness-owned transient scratch that may be mid-write
+ * while archiving — e.g. codex's CODEX_HOME/.tmp plugin clones).
+ */
+export async function archiveDirectory(dir, outPath, { exclude = [] } = {}) {
+  const args = ['-czf', outPath]
+  for (const pattern of exclude) args.push('--exclude', pattern)
+  args.push('-C', dir, '.')
+  await execFileAsync('tar', args)
   return outPath
 }
