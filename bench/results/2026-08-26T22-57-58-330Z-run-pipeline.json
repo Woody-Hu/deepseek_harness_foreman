@@ -1,0 +1,296 @@
+{
+  "timestamp": "2026-08-26T22:57:58.330Z",
+  "node": "v24.1.0",
+  "codex": "codex-cli 0.150.0",
+  "workload": {
+    "turns": 5,
+    "payloadMb": 8,
+    "seedMb": 4,
+    "modelDelayMs": 600,
+    "measuredRuns": 3
+  },
+  "serial": {
+    "runMs": 15670,
+    "executionMs": 10939,
+    "prepareMs": 440,
+    "collectMs": 503,
+    "publishMs": 3150,
+    "packagingMs": 1700,
+    "checkpointSyncMs": 1198,
+    "packSyncMs": 4934
+  },
+  "overlap": {
+    "runMs": 15380,
+    "executionMs": 11041,
+    "prepareMs": 450,
+    "collectMs": 559,
+    "publishMs": 2828,
+    "packagingMs": 2583,
+    "checkpointSyncMs": 1482,
+    "packSyncMs": 5780
+  },
+  "model": {
+    "projectedSavingMs": 1198,
+    "observedSavingMs": 290
+  },
+  "runs": [
+    {
+      "mode": "overlap",
+      "runMs": 15370,
+      "turnMs": [
+        2420,
+        2238,
+        2218,
+        2090,
+        2075
+      ],
+      "packSyncs": [
+        {
+          "turn": 2,
+          "from": 1,
+          "ms": 956
+        },
+        {
+          "turn": 5,
+          "from": 4,
+          "ms": 1038
+        },
+        {
+          "turn": 3,
+          "from": 2,
+          "ms": 1143
+        },
+        {
+          "turn": 4,
+          "from": 3,
+          "ms": 1191
+        },
+        {
+          "turn": 1,
+          "from": null,
+          "ms": 1452
+        }
+      ],
+      "prepareMs": 454,
+      "collectMs": 487,
+      "publishMs": 2795,
+      "packagingMs": 2583,
+      "checkpointSyncMs": 1464
+    },
+    {
+      "mode": "serial",
+      "runMs": 15670,
+      "turnMs": [
+        2294,
+        2171,
+        2187,
+        2126,
+        2161
+      ],
+      "packSyncs": [
+        {
+          "turn": 3,
+          "from": 2,
+          "ms": 787
+        },
+        {
+          "turn": 5,
+          "from": 4,
+          "ms": 860
+        },
+        {
+          "turn": 4,
+          "from": 3,
+          "ms": 960
+        },
+        {
+          "turn": 2,
+          "from": 1,
+          "ms": 1007
+        },
+        {
+          "turn": 1,
+          "from": null,
+          "ms": 1164
+        }
+      ],
+      "prepareMs": 440,
+      "collectMs": 489,
+      "publishMs": 3150,
+      "packagingMs": 1770,
+      "checkpointSyncMs": 1175
+    },
+    {
+      "mode": "serial",
+      "runMs": 15224,
+      "turnMs": [
+        2193,
+        2113,
+        2070,
+        2119,
+        2100
+      ],
+      "packSyncs": [
+        {
+          "turn": 4,
+          "from": 3,
+          "ms": 758
+        },
+        {
+          "turn": 3,
+          "from": 2,
+          "ms": 891
+        },
+        {
+          "turn": 2,
+          "from": 1,
+          "ms": 1035
+        },
+        {
+          "turn": 5,
+          "from": 4,
+          "ms": 1055
+        },
+        {
+          "turn": 1,
+          "from": null,
+          "ms": 1195
+        }
+      ],
+      "prepareMs": 413,
+      "collectMs": 561,
+      "publishMs": 3137,
+      "packagingMs": 1700,
+      "checkpointSyncMs": 1198
+    },
+    {
+      "mode": "overlap",
+      "runMs": 15380,
+      "turnMs": [
+        2247,
+        2271,
+        2149,
+        2087,
+        2221
+      ],
+      "packSyncs": [
+        {
+          "turn": 4,
+          "from": 3,
+          "ms": 882
+        },
+        {
+          "turn": 2,
+          "from": 1,
+          "ms": 1119
+        },
+        {
+          "turn": 3,
+          "from": 2,
+          "ms": 1116
+        },
+        {
+          "turn": 5,
+          "from": 4,
+          "ms": 1163
+        },
+        {
+          "turn": 1,
+          "from": null,
+          "ms": 1478
+        }
+      ],
+      "prepareMs": 414,
+      "collectMs": 601,
+      "publishMs": 2900,
+      "packagingMs": 2612,
+      "checkpointSyncMs": 1482
+    },
+    {
+      "mode": "overlap",
+      "runMs": 15549,
+      "turnMs": [
+        2366,
+        2254,
+        2145,
+        2119,
+        2229
+      ],
+      "packSyncs": [
+        {
+          "turn": 2,
+          "from": 1,
+          "ms": 958
+        },
+        {
+          "turn": 4,
+          "from": 3,
+          "ms": 1100
+        },
+        {
+          "turn": 5,
+          "from": 4,
+          "ms": 1132
+        },
+        {
+          "turn": 3,
+          "from": 2,
+          "ms": 1213
+        },
+        {
+          "turn": 1,
+          "from": null,
+          "ms": 1525
+        }
+      ],
+      "prepareMs": 450,
+      "collectMs": 559,
+      "publishMs": 2828,
+      "packagingMs": 2576,
+      "checkpointSyncMs": 1541
+    },
+    {
+      "mode": "serial",
+      "runMs": 15827,
+      "turnMs": [
+        2336,
+        2248,
+        2113,
+        2081,
+        2301
+      ],
+      "packSyncs": [
+        {
+          "turn": 2,
+          "from": 1,
+          "ms": 886
+        },
+        {
+          "turn": 4,
+          "from": 3,
+          "ms": 918
+        },
+        {
+          "turn": 3,
+          "from": 2,
+          "ms": 967
+        },
+        {
+          "turn": 5,
+          "from": 4,
+          "ms": 984
+        },
+        {
+          "turn": 1,
+          "from": null,
+          "ms": 1275
+        }
+      ],
+      "prepareMs": 444,
+      "collectMs": 503,
+      "publishMs": 3239,
+      "packagingMs": 1688,
+      "checkpointSyncMs": 1290
+    }
+  ]
+}

@@ -140,6 +140,11 @@ export class GitWorkspace {
     return await this.commitAll(`foreman: turn ${label}`)
   }
 
+  /** Current HEAD commit id ('' when the repo has no commits yet). */
+  async headOid() {
+    return (await this.git(['rev-parse', 'HEAD']).catch(() => '')).trim()
+  }
+
   /** Staged file list (relative paths). */
   async stagedFiles() {
     const out = await this.git(['diff', '--cached', '--name-only', '--diff-filter=ACMR'])

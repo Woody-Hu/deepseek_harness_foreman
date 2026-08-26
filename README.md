@@ -27,11 +27,13 @@ code changes.
   incremental change packs ("full first pack + incremental pack chain"). A skip-list-style
   tiered retention policy balances pack count against pack size, and periodic rebaselines
   bound the restore chain length. See [docs/checkpoint-design.md](docs/checkpoint-design.md).
-- **Overlap scheduling (ADR-0010)** — checkpoint packs are built and uploaded in the
-  background while the next turn executes; workspace packs, session archives, and publish
-  artifacts transfer concurrently. Measured on the real codex channel (5 turns × 8 MiB):
-  2 065 ms less sandbox occupancy per run (12.1%), matching the critical-path projection
-  (85% fidelity). See [bench/run-pipeline.bench.js](bench/run-pipeline.bench.js).
+- **Overlap scheduling (ADR-0011)** — run-lifecycle I/O overlaps at the session
+  boundaries: `prepare()` downloads independent objects concurrently, and `publish()`
+  runs one concurrent fan-out (artifact packaging ∥ checkpoint pack builds/uploads ∥
+  the artifact upload batch; pack content comes from immutable git commits, so
+  concurrency cannot tear a pack). The earlier per-turn background sync (ADR-0010 3a)
+  was removed as disproportionate complexity. See
+  [bench/run-pipeline.bench.js](bench/run-pipeline.bench.js).
 - **Secret interception, three layers** — path exclusion (`.env` and friends never packaged),
   content masking (`[REDACTED]` replaces secret values in packaged files and forwarded event
   streams), and git pre-commit scanning (secret-looking files are unstaged — they stay out of
@@ -103,7 +105,7 @@ solution/
     telemetry-enrich.mjs  deployment-side telemetry attribute pipeline (rule table)
   bench/
     protocol.bench.js     protocol pipeline benchmark (real loopback HTTP, no mocks)
-    run-pipeline.bench.js overlap-scheduling A/B benchmark on a real run (ADR-0010)
+    run-pipeline.bench.js session-boundary overlap A/B benchmark on a real run (ADR-0011)
   test/
     unit.test.js          unit tests (retention, redaction, formats, packs, bus, sink)
     protocols.test.js     golden-transcript conformance tests for every adapter
@@ -128,12 +130,14 @@ Requirements: Node.js >= 22.19, a built harness repository, and the `git` binary
 pnpm test                 # unit + protocol conformance + wire tests
 pnpm run bench            # protocol pipeline benchmark (real loopback HTTP)
 pnpm run bench:quick      # same, smaller workload
-pnpm run bench:pipeline   # overlap-scheduling A/B benchmark (ADR-0010; real codex channel)
+pnpm run bench:pipeline   # session-boundary overlap A/B benchmark (ADR-0011; real codex channel)
 pnpm test:e2e:basic       # cold start + session resume (dsh-sdk channel)
 pnpm test:e2e:web         # HITL approvals + crash/dangling-approval recovery (dsh-web channel)
 pnpm test:e2e:cloud       # trace shipping, snapshot sink, event bus, format adaptation
-pnpm test:e2e:checkpoint  # 7-round incremental checkpoint chain + retention + rebase
+pnpm test:e2e:checkpoint  # 7-round incremental checkpoint chain + retention + rebase (dsh-sdk)
 pnpm test:e2e:codex       # cold start + cross-sandbox resume (codex channel)
+pnpm test:e2e:checkpoint:codex  # checkpoint chain stress on the codex channel (retention/rebase/restore)
+pnpm test:e2e:config      # config-only channel switching acceptance (codex full run + dsh resolution)
 ```
 
 All tests are keyless: they run against in-process mocks of the model endpoint, the control
@@ -254,6 +258,8 @@ a matter of writing a single module.
     (`dsh-sdk` / `dsh-web` / `codex`).
   - [ADR-0010](docs/adr/0010-overlap-scheduling.md) — overlap scheduling for run-lifecycle
     I/O, with the critical-path model and measured verification.
+  - [ADR-0011](docs/adr/0011-session-boundary-overlap-scheduling.md) — session-boundary
+    overlap scheduling (simplification; supersedes ADR-0010's per-turn background sync).
 
 ## License
 

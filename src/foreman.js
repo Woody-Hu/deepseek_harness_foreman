@@ -48,9 +48,11 @@
  * Workspace incremental sync (checkpoints configuration): restore/upload uses
  * a "full first pack + incremental pack chain"; skip-list style tiered
  * retention balances pack count against pack size (level = v2(turn), each
- * level keeps only the most recent few). Run-lifecycle I/O overlaps execution
- * (ADR-0010): per-turn packs upload on a background chain while the next
- * turn runs, and prepare/publish transfer independent objects concurrently.
+ * level keeps only the most recent few). Run-lifecycle I/O overlaps at the
+ * session boundaries (ADR-0011): prepare() downloads independent objects
+ * concurrently, and publish() runs one concurrent fan-out — packaging,
+ * checkpoint pack builds/uploads, and the artifact batch overlap (pack content
+ * comes from immutable commits, so concurrency cannot tear a pack).
  */
 import { cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
@@ -239,8 +241,9 @@ export class SseGateway {
  *   { recentKeep?, perLevel?, rebaseAfter?, overlap? } — restore/upload uses "full
  *   first pack + incremental packs"; skip-list style tiered retention
  *   balances pack count against size; rebaseAfter bounds the restore chain
- *   length (0 = never rebase); overlap=true (default) uploads each turn's
- *   checkpoint pack in the background while the next turn executes (ADR-0010)
+ *   length (0 = never rebase); overlap=true (default) runs the publish
+ *   fan-out concurrently — packaging, checkpoint pack builds/uploads and the
+ *   artifact batch overlap (ADR-0011); overlap=false serializes publish
  */
 export class Foreman {
   constructor(options) {
@@ -256,9 +259,7 @@ export class Foreman {
     this.external = {} // results/stats of external wiring like shipper/bus/git/checkpoints (merged into publish result)
     this.promptTurns = 0 // turns completed (and committed) this run
     this.lastTurnCommit = undefined // the last per-turn commit result (reported at collect)
-    this.ckptPreloaded = new Map() // turn -> from, packs already uploaded by the background sync (ADR-0010)
-    this.ckptSyncChain = undefined // serialized background-sync promise tail
-    this.ckptSyncRecords = [] // per-pack sync timings { turn, from, ms, phase: 'background'|'publish' }
+    this.ckptSyncRecords = [] // per-pack sync timings { turn, from, ms } (all at publish — ADR-0011)
   }
 
   get workspaceDir() { return join(this.options.workdir, 'workspace') }
@@ -397,8 +398,7 @@ export class Foreman {
           const packDir = join(this.options.workdir, `restore-${pack.turn}`)
           await extractChangePack(archiveFile, packDir)
           const applied = await applyChangePack(this.git, packDir, `foreman: checkpoint ${pack.turn} (replayed)`)
-          const oid = applied.oid
-            ?? (await this.git.git(['rev-parse', 'HEAD']).catch(() => '')).trim() // an empty change pack lands on the current HEAD
+          const oid = applied.oid ?? await this.git.headOid() // an empty change pack lands on the current HEAD
           this.ckpt.oids.set(pack.turn, oid === '' ? undefined : oid)
           this.ckpt.turn = pack.turn
           restored.push(pack.turn)
@@ -575,9 +575,8 @@ export class Foreman {
 
   /**
    * Send a task and wait for completion (turn/end). With checkpoints enabled
-   * the turn is committed immediately after completion and its pack is
-   * built+uploaded on the background chain while the next turn executes
-   * (ADR-0010 3a); collect()/publish() skip/drain that chain.
+   * the turn is committed immediately after completion (the commit is
+   * immutable pack input — packs build+upload at publish, ADR-0011).
    */
   async prompt(text, { timeoutMs = 120_000 } = {}) {
     const t0 = Date.now()
@@ -589,69 +588,12 @@ export class Foreman {
       const t1 = Date.now()
       this.ckpt.turn += 1
       const turn = await this.git.commitTurn(`#${this.ckpt.turn}`)
-      const oid = turn.oid ?? (await this.git.git(['rev-parse', 'HEAD']).catch(() => '')).trim()
+      const oid = turn.oid ?? await this.git.headOid()
       this.ckpt.oids.set(this.ckpt.turn, oid === '' ? undefined : oid)
       this.lastTurnCommit = turn
       this.timings.turnCommitMs = Date.now() - t1
-      if (this.options.checkpoints?.overlap !== false) this.#enqueueCheckpointSync(this.ckpt.turn)
     }
     return result
-  }
-
-  /**
-   * The retention-plan anchor for a turn (ADR-0010 3a): the nearest kept
-   * predecessor under the skip-list policy as of this turn — the same mapping
-   * syncCheckpoints() applies at publish, so the last turn's background pack
-   * always matches the authoritative desired entry.
-   */
-  #checkpointAnchor(turn) {
-    const rebasedAt = this.ckpt.index.rebasedAt ?? 0
-    const relative = turn - rebasedAt
-    if (relative < 1) return null
-    const entry = this.ckpt.keeper.planPacks(relative).find((plan) => plan.turn === relative)
-    if (entry === undefined) return rebasedAt > 0 ? rebasedAt : null
-    return entry.from === null ? (rebasedAt > 0 ? rebasedAt : null) : rebasedAt + entry.from
-  }
-
-  /**
-   * Enqueue a background checkpoint sync for a completed turn (ADR-0010 3a):
-   * build + upload pack(anchor -> turn) on a serialized promise chain (one at
-   * a time — git object reads stay ordered) while the next turn executes.
-   * Pack content comes from commits only, so concurrent workspace mutation by
-   * the harness cannot tear a pack. A failure rejects the chain; publish()'s
-   * drain rethrows it (fail loud — never silently lose a checkpoint).
-   */
-  #enqueueCheckpointSync(turn) {
-    const run = async () => {
-      const startedAt = Date.now()
-      const from = this.#checkpointAnchor(turn)
-      const toRef = this.ckpt.oids.get(turn)
-      const fromRef = from === null ? null : this.ckpt.oids.get(from)
-      if (toRef === undefined || (from !== null && fromRef === undefined)) {
-        throw new Error(`foreman: background checkpoint ${String(turn)} commit missing`)
-      }
-      const stagingDir = join(this.options.workdir, 'checkpoint-staging')
-      await mkdir(stagingDir, { recursive: true })
-      const packPath = join(stagingDir, packKey(turn))
-      await buildChangePack(this.git, { fromRef, toRef, fromTurn: from, toTurn: turn, outPath: packPath })
-      await uploadArtifact(
-        this.options.controlPlane, this.options.agentId,
-        `${this.options.sessionId}/${packKey(turn)}`, await readFile(packPath),
-      )
-      this.ckptPreloaded.set(turn, from)
-      this.ckptSyncRecords.push({ turn, from, ms: Date.now() - startedAt, phase: 'background' })
-    }
-    this.ckptSyncChain = (this.ckptSyncChain ?? Promise.resolve()).then(run)
-    this.ckptSyncChain.catch(() => {}) // never unhandled; publish()'s drain re-awaits the tail
-    return this.ckptSyncChain
-  }
-
-  /** Drain the background checkpoint chain (ADR-0010 invariant 2: no reclaim with a pending sync). */
-  async #drainCheckpointSyncs() {
-    if (this.ckptSyncChain === undefined) return
-    const t0 = Date.now()
-    await this.ckptSyncChain
-    this.timings.checkpointDrainMs = Date.now() - t0
   }
 
   /** Graceful shutdown (each channel implements its own: quit request/signal -> timeout fallback; flush external wiring when publish did not run). */
@@ -710,7 +652,7 @@ export class Foreman {
         if (this.ckpt !== undefined) this.ckpt.turn += 1
         turn = await this.git.commitTurn(this.ckpt !== undefined ? `#${this.ckpt.turn}` : this.options.sessionId)
         if (this.ckpt !== undefined) {
-          const oid = turn.oid ?? (await this.git.git(['rev-parse', 'HEAD']).catch(() => '')).trim()
+          const oid = turn.oid ?? await this.git.headOid()
           this.ckpt.oids.set(this.ckpt.turn, oid === '' ? undefined : oid)
         }
       }
@@ -739,29 +681,48 @@ export class Foreman {
    * event bus) is flushed — the graceful path guarantees every produced trace
    * and stream payload has been delivered before the system reclaims the
    * sandbox.
+   *
+   * Session-end fan-out (ADR-0011): packaging (reads the working tree) and
+   * the checkpoint chain sync (reads immutable commits) are independent, so
+   * with checkpoints.overlap !== false they run concurrently; the artifact
+   * batch then uploads concurrently (independent objects).
    */
   async publish() {
     const t0 = Date.now()
     const { agentId, sessionId, controlPlane, secretValues = [] } = this.options
-    // ADR-0010 invariant 2: no reclaim path starts while a background
-    // checkpoint sync is in flight; a failed sync rethrows here (fail loud)
-    await this.#drainCheckpointSyncs()
     await rm(this.artifactsDir, { recursive: true, force: true })
     await mkdir(this.artifactsDir, { recursive: true })
     const workspaceArchive = join(this.artifactsDir, 'workspace.tar.gz')
     const sessionsArchive = join(this.artifactsDir, 'sessions.tar.gz')
     const tracePath = join(this.artifactsDir, 'trace.jsonl')
-    // Packaging runs concurrently (independent sources — ADR-0010 3c). The
-    // session archive excludes harness-owned transient scratch: the harness
+    // The session archive excludes harness-owned transient scratch: the harness
     // process is still alive at publish time and codex keeps mutating
     // CODEX_HOME/.tmp (in-flight plugin clones), which would fail the archive
     // with "file changed as we read it" — .tmp is regenerated on demand and
     // never carries durable session state (ADR-0005).
-    const [packaged] = await Promise.all([
-      packageWorkspace(this.workspaceDir, workspaceArchive, { secretValues }),
-      archiveDirectory(this.sessionRoot, sessionsArchive, { exclude: ['./.tmp'] }),
-      writeFile(tracePath, this.traceFrames.map((frame) => JSON.stringify(frame)).join('\n') + '\n'),
-    ])
+    const packaging = async () => {
+      const startedAt = Date.now()
+      const [packaged] = await Promise.all([
+        packageWorkspace(this.workspaceDir, workspaceArchive, { secretValues }),
+        archiveDirectory(this.sessionRoot, sessionsArchive, { exclude: ['./.tmp'] }),
+        writeFile(tracePath, this.traceFrames.map((frame) => JSON.stringify(frame)).join('\n') + '\n'),
+      ])
+      this.timings.packagingMs = Date.now() - startedAt
+      return packaged
+    }
+    const checkpointSync = () => (this.ckpt === undefined ? undefined : this.syncCheckpoints())
+
+    let packaged
+    let checkpoints
+    if (this.options.checkpoints?.overlap !== false) {
+      // Concurrent fan-out: packaging and the checkpoint sync overlap (ADR-0011)
+      ;[packaged, checkpoints] = await Promise.all([packaging(), checkpointSync()])
+    } else {
+      // Serialized reference path (benchmark A/B baseline)
+      packaged = await packaging()
+      checkpoints = await checkpointSync()
+    }
+    if (checkpoints !== undefined) this.external.checkpoints = checkpoints
 
     const result = {
       agentId,
@@ -777,15 +738,8 @@ export class Foreman {
       exitCode: this.exitCode,
       git: this.gitInfo, // baseline/turn commit oids, authoritative change set, secret interception violations
     }
+    if (checkpoints !== undefined) result.checkpoints = checkpoints
     await writeFile(join(this.artifactsDir, 'result.json'), JSON.stringify(result, null, 2))
-
-    // Checkpoint chain: retention policy -> incremental pack upload/rebuild ->
-    // expired pack deletion -> index update (packs already uploaded by the
-    // background chain are counted as uploaded, never re-uploaded)
-    if (this.ckpt !== undefined) {
-      this.external.checkpoints = await this.syncCheckpoints()
-      result.checkpoints = this.external.checkpoints
-    }
 
     // Flush asynchronous external wiring (delivery guarantee before reclaim);
     // stats merge into result for cloud-side observability
@@ -799,8 +753,7 @@ export class Foreman {
     result.eventBus = this.busStats
     await writeFile(join(this.artifactsDir, 'result.json'), JSON.stringify(result, null, 2))
 
-    // The artifact batch uploads concurrently (independent objects —
-    // ADR-0010 3c)
+    // The artifact batch uploads concurrently (independent objects)
     const uploads = [
       ['result.json', await readFile(join(this.artifactsDir, 'result.json'))],
       ['workspace.tar.gz', await readFile(workspaceArchive)],
@@ -852,6 +805,9 @@ export class Foreman {
    *      from=null full pack resetting the chain head (bounding the restore chain)
    *   4. the checkpoints.json index is written back to object storage
    *      (restore replays packs in order)
+   * Pack builds/uploads run concurrently under checkpoints.overlap (each pack
+   * stages into its own directory and reads immutable commits — ADR-0011);
+   * the index is written only after every upload completed.
    * @returns {Promise<{turn: number, rebasedAt: number, kept: number, uploaded: number, rebuilt: number, deleted: number, packs: Array<{turn: number, from: number|null, object: string}>}>}
    */
   async syncCheckpoints() {
@@ -862,6 +818,7 @@ export class Foreman {
     const index = ckpt.index
     const rebasedAtBefore = index.rebasedAt ?? 0
     const rebaseAfter = this.options.checkpoints?.rebaseAfter ?? 0
+    const syncStartedAt = Date.now()
     let rebasedAt = rebasedAtBefore
     let desired
     if (currentTurn === 0) {
@@ -887,15 +844,7 @@ export class Foreman {
       }
     }
     const desiredTurns = new Set(desired.map((entry) => entry.turn))
-    for (const entry of desired) {
-      const existing = index.packs.find((pack) => pack.turn === entry.turn)
-      if (existing !== undefined && existing.from === entry.from) { stats.kept += 1; continue }
-      if (this.ckptPreloaded.get(entry.turn) === entry.from) {
-        // ADR-0010 3a: already built+uploaded by the per-turn background sync
-        // while the next turn executed; counted as uploaded, never re-uploaded
-        stats.uploaded += 1
-        continue
-      }
+    const uploadPack = async (entry, existing) => {
       const toRef = ckpt.oids.get(entry.turn)
       const fromRef = entry.from === null ? null : ckpt.oids.get(entry.from)
       if (toRef === undefined) throw new Error(`foreman: checkpoint ${String(entry.turn)} commit missing`)
@@ -908,9 +857,17 @@ export class Foreman {
         fromRef, toRef, fromTurn: entry.from, toTurn: entry.turn, outPath: packPath,
       })
       await uploadArtifact(controlPlane, agentId, `${sessionId}/${packKey(entry.turn)}`, await readFile(packPath))
-      this.ckptSyncRecords.push({ turn: entry.turn, from: entry.from, ms: Date.now() - packStartedAt, phase: 'publish' })
+      this.ckptSyncRecords.push({ turn: entry.turn, from: entry.from, ms: Date.now() - packStartedAt })
       stats[existing === undefined ? 'uploaded' : 'rebuilt'] += 1
     }
+    const pending = []
+    for (const entry of desired) {
+      const existing = index.packs.find((pack) => pack.turn === entry.turn)
+      if (existing !== undefined && existing.from === entry.from) { stats.kept += 1; continue }
+      pending.push(uploadPack(entry, existing))
+    }
+    if (this.options.checkpoints?.overlap !== false) await Promise.all(pending)
+    else for (const task of pending) await task
     for (const pack of index.packs) {
       if (!desiredTurns.has(pack.turn)) {
         await deleteArtifact(controlPlane, agentId, `${sessionId}/${pack.object}`)
@@ -926,6 +883,7 @@ export class Foreman {
       controlPlane, agentId, `${sessionId}/${INDEX_KEY}`,
       Buffer.from(JSON.stringify(ckpt.index, null, 2)),
     )
+    this.timings.checkpointSyncMs = Date.now() - syncStartedAt
     return { turn: currentTurn, rebasedAt, ...stats, packs: ckpt.index.packs }
   }
 }
