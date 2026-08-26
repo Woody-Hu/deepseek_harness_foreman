@@ -22,17 +22,22 @@
  *              + upload session logs/traces + emit message bus events to
  *              reclaim the sandbox
  *
- * Channels:
- *   channel='stdio'  SDK JSON-RPC (channels/sdk-channel.js): jsonrpc-demo bin
- *                    + NDJSON stdio; session resume needs the bundled
- *                    resume-adapter plugin; no HITL
- *   channel='web'    Web apiproxy (channels/web-channel.js): dsh web +
- *                    HTTP/WS; native cold-session resume (api-remotes
- *                    resolver), full HITL approval support
+ * Channels (canonical ids per ADR-0009; legacy aliases 'stdio'/'web' accepted):
+ *   channel='dsh-sdk'  dsh SDK JSON-RPC (channels/sdk-channel.js): jsonrpc-demo
+ *                      bin + NDJSON stdio; session resume needs the bundled
+ *                      resume-adapter plugin; no HITL
+ *   channel='dsh-web'  dsh web apiproxy (channels/web-channel.js): dsh web +
+ *                      HTTP/WS; native cold-session resume (api-remotes
+ *                      resolver), full HITL approval support
+ *   channel='codex'    Codex Harness app-server (channels/codex-channel.js):
+ *                      codex app-server --stdio JSON-RPC; session resume via
+ *                      the CODEX_HOME sessionId->threadId index (ADR-0005)
  *
  * Session identity: the external session id doubles as the dsh session id
  * (dsh's session.create/agents.create both accept caller-provided ids; the
  * JSONL persistence layer escapes path-unsafe characters) — no mapping table.
+ * The codex channel maps sessionId -> codex threadId through a persisted
+ * index (codex generates its own thread ids).
  *
  * Trace dual path:
  *   A. dsh's native session-telemetry-otel -> OTLP collector (wired through
@@ -43,7 +48,9 @@
  * Workspace incremental sync (checkpoints configuration): restore/upload uses
  * a "full first pack + incremental pack chain"; skip-list style tiered
  * retention balances pack count against pack size (level = v2(turn), each
- * level keeps only the most recent few).
+ * level keeps only the most recent few). Run-lifecycle I/O overlaps execution
+ * (ADR-0010): per-turn packs upload on a background chain while the next
+ * turn runs, and prepare/publish transfer independent objects concurrently.
  */
 import { cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
@@ -58,7 +65,7 @@ import { SdkChannel } from './channels/sdk-channel.js'
 import { WebChannel } from './channels/web-channel.js'
 import { CodexChannel } from './channels/codex-channel.js'
 import { createEventFormatter, renderSseLine } from './events/formats.js'
-import { loadForemanConfig, resolveConfigPath } from './config.js'
+import { loadForemanConfig, resolveChannelId, resolveConfigPath } from './config.js'
 import { TraceShipper } from './observability/trace-shipper.js'
 import { createSnapshotSink } from './storage/snapshot-sink.js'
 import { createEventBus } from './events/event-bus.js'
@@ -193,17 +200,23 @@ export class SseGateway {
  * @param {object} options
  * @param {string} options.repoRoot dsh repository root (cwd of the tsx source launch)
  * @param {string} options.workdir isolated directory for this run (workspace/sessions/artifacts live under it)
- * @param {'stdio'|'web'} [options.channel] the integration channel (default 'stdio')
+ * @param {'dsh-sdk'|'dsh-web'|'codex'} [options.channel] harness channel, canonical ids per
+ *   ADR-0009 (legacy aliases 'stdio'/'web' accepted); default 'dsh-sdk'; also
+ *   settable via the config file's harness.channel (constructor wins)
  * @param {string} options.agentId object storage bucket (agent dimension)
- * @param {string} options.sessionId dsh session id (caller-defined; reuse across runs = session resume)
+ * @param {string} options.sessionId external session id (caller-defined; reuse across runs = session resume)
  * @param {object} options.modelEnv { DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL } — env-injected only, never written to disk
  * @param {object} options.controlPlane { baseUrl } control-plane handle
  * @param {object} options.telemetry { mode, otlpUrl } trace path A wiring
- * @param {string} [options.pluginsDir] runner-bundled adapter plugin directory (materialized next to the config; shared by both channels)
+ * @param {string} [options.pluginsDir] runner-bundled adapter plugin directory (materialized next to the config; dsh-sdk channel)
  * @param {string[]} [options.secretValues] known secret values (for masking)
- * @param {object} [options.envExtra] extra env entries injected into the dsh child process
+ * @param {object} [options.envExtra] extra env entries injected into the harness child process
  *   (e.g. tenant/trace ids — injected through the same non-persistent channel
  *   as secrets; expanded into the spawn env by the driver layer)
+ * @param {object} [options.codex] codex channel options (constructor level; override the config
+ *   file's harness.codex): { binary?, args?, model?, baseUrl?, apiKey?, approvalPolicy?,
+ *   sandbox?, timeoutMs? } — baseUrl points the harness at a Responses-API endpoint;
+ *   apiKey is injected via env only, never written to disk
  * @param {object} [options.traceShipper] async trace shipping:
  *   { upstreamUrl, headers?, headersEnv?, maxQueue?, retries?, retryBaseMs? } —
  *   when enabled, dsh's OTLP points at the shipper's local receiver and a
@@ -223,14 +236,15 @@ export class SseGateway {
  *   secret values default to secretValues; baseline/turn commits + secret
  *   interception
  * @param {object} [options.checkpoints] workspace incremental sync chain (requires git.enabled):
- *   { recentKeep?, perLevel?, rebaseAfter? } — restore/upload uses "full
+ *   { recentKeep?, perLevel?, rebaseAfter?, overlap? } — restore/upload uses "full
  *   first pack + incremental packs"; skip-list style tiered retention
  *   balances pack count against size; rebaseAfter bounds the restore chain
- *   length (0 = never rebase)
+ *   length (0 = never rebase); overlap=true (default) uploads each turn's
+ *   checkpoint pack in the background while the next turn executes (ADR-0010)
  */
 export class Foreman {
   constructor(options) {
-    this.options = { channel: 'stdio', ...options }
+    this.options = options // channel stays raw: canonical resolution needs the (async) config load
     if (this.options.checkpoints !== undefined && this.options.git?.enabled !== true) {
       throw new Error('foreman: checkpoints require git.enabled')
     }
@@ -240,40 +254,82 @@ export class Foreman {
     this.timings = {}
     this.pendingApprovals = new Map() // approvalId -> { rpcId, frame } (web channel HITL)
     this.external = {} // results/stats of external wiring like shipper/bus/git/checkpoints (merged into publish result)
+    this.promptTurns = 0 // turns completed (and committed) this run
+    this.lastTurnCommit = undefined // the last per-turn commit result (reported at collect)
+    this.ckptPreloaded = new Map() // turn -> from, packs already uploaded by the background sync (ADR-0010)
+    this.ckptSyncChain = undefined // serialized background-sync promise tail
+    this.ckptSyncRecords = [] // per-pack sync timings { turn, from, ms, phase: 'background'|'publish' }
   }
 
   get workspaceDir() { return join(this.options.workdir, 'workspace') }
-  get isWeb() { return this.options.channel === 'web' }
-  /** Session log root: stdio = workdir/.sessions; web = DSH_HOME/sessions; codex = CODEX_HOME/threads. */
+  get isWeb() { return this.channelId === 'dsh-web' }
+  /**
+   * Session log root: dsh-sdk = workdir/.sessions; dsh-web = DSH_HOME/sessions;
+   * codex = workdir/.codex (CODEX_HOME — thread store + sessionId->threadId index).
+   */
   get sessionRoot() {
-    if (this.options.channel === 'codex') {
+    if (this.channelId === 'codex') {
       return join(this.options.workdir, '.codex')
     }
     return this.isWeb ? join(this.options.workdir, 'dsh-home', 'sessions') : join(this.options.workdir, '.sessions')
   }
   get artifactsDir() { return join(this.options.workdir, 'artifacts') }
 
+  /** Load + cache the runner configuration file (no-op when absent). */
+  async #ensureConfig() {
+    if (this.config === undefined) this.config = await loadForemanConfig(resolveConfigPath(this.options))
+    return this.config
+  }
+
+  /**
+   * Resolve the harness channel id (ADR-0009): constructor option > config file
+   * (harness.channel) > 'dsh-sdk'; legacy aliases map to canonical ids and
+   * unknown ids fail loud. Cached in this.channelId (idempotent).
+   */
+  async #resolveChannel() {
+    const config = await this.#ensureConfig()
+    this.channelId = resolveChannelId(this.options.channel ?? config.harness?.channel ?? 'dsh-sdk')
+    return this.channelId
+  }
+
   /** Restore composition config and the workspace from object storage; establish the manifest baseline. */
   async prepare() {
     const t0 = Date.now()
     await mkdir(this.options.workdir, { recursive: true })
+    await this.#resolveChannel()
     const { agentId, sessionId, controlPlane } = this.options
-    const configKey = this.isWeb ? `${sessionId}/web-patch.yml` : `${sessionId}/cordis.yml`
-    const configBuffer = await downloadArtifact(controlPlane, agentId, configKey)
-    this.configPath = join(this.options.workdir, this.isWeb ? 'web-patch.yml' : 'cordis.yml')
-    await writeFile(this.configPath, configBuffer)
 
-    // Runner-bundled adapter plugins (the cloud owns the composition config,
-    // the runner binary owns its own adapter layer):
-    //   stdio channel: materialized next to the config (the demo bin's loader
-    //                  root = the config file's directory; cordis.yml references
-    //                  ./plugins/* relative paths)
-    //   web channel:   materialized by the web driver to $DSH_HOME/profiles/web/
-    //                  (the loader root of the profile launch face is anchored
-    //                  at the profile directory, see web-channel.start)
-    if (!this.isWeb && this.options.pluginsDir !== undefined) {
-      await cp(this.options.pluginsDir, join(this.options.workdir, 'plugins'), { recursive: true })
+    // Composition config (dsh channels only — the codex channel needs no dsh
+    // composition; its model wiring lives in CODEX_HOME/config.toml).
+    if (this.channelId !== 'codex') {
+      const configKey = this.isWeb ? `${sessionId}/web-patch.yml` : `${sessionId}/cordis.yml`
+      const configBuffer = await downloadArtifact(controlPlane, agentId, configKey)
+      this.configPath = join(this.options.workdir, this.isWeb ? 'web-patch.yml' : 'cordis.yml')
+      await writeFile(this.configPath, configBuffer)
+
+      // Runner-bundled adapter plugins (the cloud owns the composition config,
+      // the runner binary owns its own adapter layer):
+      //   dsh-sdk channel: materialized next to the config (the demo bin's
+      //                    loader root = the config file's directory; cordis.yml
+      //                    references ./plugins/* relative paths)
+      //   dsh-web channel: materialized by the web driver to
+      //                    $DSH_HOME/profiles/web/ (the loader root of the
+      //                    profile launch face is anchored at the profile
+      //                    directory, see web-channel.start)
+      if (this.channelId === 'dsh-sdk' && this.options.pluginsDir !== undefined) {
+        await cp(this.options.pluginsDir, join(this.options.workdir, 'plugins'), { recursive: true })
+      }
     }
+
+    // Session log download starts immediately and overlaps the workspace
+    // restore (independent objects — ADR-0010 3b). Restore: extract into
+    // sessionRoot; the harness (dsh: sessionId+cwd; codex: the threads-index
+    // mapping restored with it) continues the history — cross-sandbox session
+    // resume. Note: resume requires the workspace's absolute path to match
+    // the previous round (cloud sandboxes use fixed mount points).
+    const sessionsDownload = downloadArtifact(controlPlane, agentId, `${sessionId}/sessions.tar.gz`)
+      .then((buffer) => ({ buffer }))
+      .catch(() => ({ buffer: null })) // first round: no session logs in object storage yet
 
     // Workspace "before" state (checkpoint mode prefers the incremental pack
     // chain; the seed only provides the first-round cold-start state):
@@ -298,28 +354,23 @@ export class Foreman {
       await extractArchive(workspaceBundle, this.workspaceDir)
     }
 
-    // Session log restore: if the sessions.tar.gz uploaded by the previous
-    // round's publish exists, extract it into sessionRoot; dsh locates the
-    // session by sessionId + cwd (projectKey) and continues the history —
-    // cross-sandbox session resume. Note: resume requires the workspace's
-    // absolute path to match the previous round (cloud sandboxes use fixed
-    // mount points, e.g. /workspace).
-    const sessionsBundle = join(this.options.workdir, 'seed-sessions.tar.gz')
-    try {
-      const sessionsBuffer = await downloadArtifact(controlPlane, agentId, `${sessionId}/sessions.tar.gz`)
+    const { buffer: sessionsBuffer } = await sessionsDownload
+    if (sessionsBuffer !== null) {
+      const sessionsBundle = join(this.options.workdir, 'seed-sessions.tar.gz')
       await writeFile(sessionsBundle, sessionsBuffer)
       await extractArchive(sessionsBundle, this.sessionRoot)
-    } catch { /* first round: no session logs in object storage yet; 404 means a fresh session */ }
+    }
 
     this.baselineManifest = await fileManifest(this.workspaceDir)
 
     // Local workspace git: the restored workspace gets a baseline commit (the
-    // "before" state); commitTurn at the end of this round produces the
-    // authoritative change set (git diff); secret files are intercepted before
-    // committing (kept out of history and out of the .git upload). Checkpoint
-    // mode: restore = replay the incremental pack chain (one commit per pack,
-    // replaying git history), and this round's change baseline = the restore
-    // end state (the last commit on the chain)
+    // "before" state); turn commits (per prompt when checkpoints are enabled —
+    // ADR-0010 3a, otherwise at collect()) produce the authoritative change
+    // set (git diff); secret files are intercepted before committing (kept out
+    // of history and out of the .git upload). Checkpoint mode: restore =
+    // replay the incremental pack chain (one commit per pack, replaying git
+    // history), and this round's change baseline = the restore end state (the
+    // last commit on the chain)
     if (this.options.git?.enabled === true) {
       this.git = new GitWorkspace({
         cwd: this.workspaceDir,
@@ -335,10 +386,14 @@ export class Foreman {
           index: ckptIndex,
         }
         const restored = []
-        for (const pack of ckptIndex.packs) {
-          const buffer = await downloadArtifact(controlPlane, agentId, `${sessionId}/${pack.object}`)
+        // Packs download concurrently (independent objects — ADR-0010 3b) and
+        // apply sequentially (the git replay chain is ordered)
+        const packBuffers = await Promise.all(
+          ckptIndex.packs.map((pack) => downloadArtifact(controlPlane, agentId, `${sessionId}/${pack.object}`)),
+        )
+        for (const [position, pack] of ckptIndex.packs.entries()) {
           const archiveFile = join(this.options.workdir, `restore-${pack.turn}.tar.gz`)
-          await writeFile(archiveFile, buffer)
+          await writeFile(archiveFile, packBuffers[position])
           const packDir = join(this.options.workdir, `restore-${pack.turn}`)
           await extractChangePack(archiveFile, packDir)
           const applied = await applyChangePack(this.git, packDir, `foreman: checkpoint ${pack.turn} (replayed)`)
@@ -387,9 +442,7 @@ export class Foreman {
     // Outbound event stream: formatter + bus + delivery mode. Protocol
     // selection precedence (ADR-0002): constructor option > runner config
     // file (configPath / FOREMAN_CONFIG) > built-in default 'native'.
-    if (this.config === undefined) {
-      this.config = await loadForemanConfig(resolveConfigPath(this.options))
-    }
+    await this.#resolveChannel()
     const events = { ...this.config.events, ...this.options.events }
     if (events.bus !== undefined) {
       this.bus = createEventBus(events.bus)
@@ -471,26 +524,34 @@ export class Foreman {
       this.webInfo = info
       this.phase = 'running'
       this.timings.bootMs = this.channel.timings.bootMs
-      this.gateway.publish({ kind: 'foreman.phase', phase: 'running', sessionId: this.options.sessionId, channel: 'web', dshUrl: info.url })
+      this.gateway.publish({ kind: 'foreman.phase', phase: 'running', sessionId: this.options.sessionId, channel: 'dsh-web', dshUrl: info.url })
       return info
     }
 
-    if (this.options.channel === 'codex') {
+    if (this.channelId === 'codex') {
+      // Codex channel wiring (ADR-0005): CODEX_HOME = foreman's sessionRoot
+      // (archived/restored as the session logs — carries the thread store and
+      // the sessionId->threadId index for cross-sandbox resume); model
+      // endpoint/key via constructor codex options > config harness.codex.
       const harness = this.config?.harness ?? {}
       this.channel = new CodexChannel({
         workspaceDir: this.workspaceDir,
+        codexHome: this.sessionRoot,
+        sessionId: this.options.sessionId,
         binary: harness.codex?.binary,
         args: harness.codex?.args,
-        model: harness.codex?.model ?? this.options.model,
+        model: harness.codex?.model,
         approvalPolicy: harness.codex?.approvalPolicy,
+        sandbox: harness.codex?.sandbox,
         timeoutMs: harness.codex?.timeoutMs,
-        modelEnv,
+        baseUrl: harness.codex?.provider?.baseUrl,
         envExtra: this.options.envExtra,
+        ...(this.options.codex ?? {}), // constructor-level overrides (incl. apiKey — env-injected only)
       })
       const init = await this.channel.start({ onEvent, onStatus })
       this.phase = 'running'
       this.timings.bootMs = this.channel.timings.bootMs
-      this.gateway.publish({ kind: 'foreman.phase', phase: 'running', sessionId: this.options.sessionId, channel: 'codex' })
+      this.gateway.publish({ kind: 'foreman.phase', phase: 'running', sessionId: this.options.sessionId, channel: 'codex', threadId: init.threadId, resumed: init.resumed === true })
       return init
     }
 
@@ -508,17 +569,89 @@ export class Foreman {
     const init = await this.channel.start({ onEvent, onStatus })
     this.phase = 'running'
     this.timings.bootMs = this.channel.timings.bootMs
-    this.gateway.publish({ kind: 'foreman.phase', phase: 'running', sessionId: this.options.sessionId, channel: 'stdio' })
+    this.gateway.publish({ kind: 'foreman.phase', phase: 'running', sessionId: this.options.sessionId, channel: 'dsh-sdk' })
     return init
   }
 
-  /** Send a task and wait for completion (turn/end). */
+  /**
+   * Send a task and wait for completion (turn/end). With checkpoints enabled
+   * the turn is committed immediately after completion and its pack is
+   * built+uploaded on the background chain while the next turn executes
+   * (ADR-0010 3a); collect()/publish() skip/drain that chain.
+   */
   async prompt(text, { timeoutMs = 120_000 } = {}) {
     const t0 = Date.now()
     const result = await this.channel.prompt(this.options.sessionId, text, { timeoutMs })
     this.lastTurnEndReason = result.reason
     this.timings.turnMs = Date.now() - t0
+    this.promptTurns += 1
+    if (this.ckpt !== undefined) {
+      const t1 = Date.now()
+      this.ckpt.turn += 1
+      const turn = await this.git.commitTurn(`#${this.ckpt.turn}`)
+      const oid = turn.oid ?? (await this.git.git(['rev-parse', 'HEAD']).catch(() => '')).trim()
+      this.ckpt.oids.set(this.ckpt.turn, oid === '' ? undefined : oid)
+      this.lastTurnCommit = turn
+      this.timings.turnCommitMs = Date.now() - t1
+      if (this.options.checkpoints?.overlap !== false) this.#enqueueCheckpointSync(this.ckpt.turn)
+    }
     return result
+  }
+
+  /**
+   * The retention-plan anchor for a turn (ADR-0010 3a): the nearest kept
+   * predecessor under the skip-list policy as of this turn — the same mapping
+   * syncCheckpoints() applies at publish, so the last turn's background pack
+   * always matches the authoritative desired entry.
+   */
+  #checkpointAnchor(turn) {
+    const rebasedAt = this.ckpt.index.rebasedAt ?? 0
+    const relative = turn - rebasedAt
+    if (relative < 1) return null
+    const entry = this.ckpt.keeper.planPacks(relative).find((plan) => plan.turn === relative)
+    if (entry === undefined) return rebasedAt > 0 ? rebasedAt : null
+    return entry.from === null ? (rebasedAt > 0 ? rebasedAt : null) : rebasedAt + entry.from
+  }
+
+  /**
+   * Enqueue a background checkpoint sync for a completed turn (ADR-0010 3a):
+   * build + upload pack(anchor -> turn) on a serialized promise chain (one at
+   * a time — git object reads stay ordered) while the next turn executes.
+   * Pack content comes from commits only, so concurrent workspace mutation by
+   * the harness cannot tear a pack. A failure rejects the chain; publish()'s
+   * drain rethrows it (fail loud — never silently lose a checkpoint).
+   */
+  #enqueueCheckpointSync(turn) {
+    const run = async () => {
+      const startedAt = Date.now()
+      const from = this.#checkpointAnchor(turn)
+      const toRef = this.ckpt.oids.get(turn)
+      const fromRef = from === null ? null : this.ckpt.oids.get(from)
+      if (toRef === undefined || (from !== null && fromRef === undefined)) {
+        throw new Error(`foreman: background checkpoint ${String(turn)} commit missing`)
+      }
+      const stagingDir = join(this.options.workdir, 'checkpoint-staging')
+      await mkdir(stagingDir, { recursive: true })
+      const packPath = join(stagingDir, packKey(turn))
+      await buildChangePack(this.git, { fromRef, toRef, fromTurn: from, toTurn: turn, outPath: packPath })
+      await uploadArtifact(
+        this.options.controlPlane, this.options.agentId,
+        `${this.options.sessionId}/${packKey(turn)}`, await readFile(packPath),
+      )
+      this.ckptPreloaded.set(turn, from)
+      this.ckptSyncRecords.push({ turn, from, ms: Date.now() - startedAt, phase: 'background' })
+    }
+    this.ckptSyncChain = (this.ckptSyncChain ?? Promise.resolve()).then(run)
+    this.ckptSyncChain.catch(() => {}) // never unhandled; publish()'s drain re-awaits the tail
+    return this.ckptSyncChain
+  }
+
+  /** Drain the background checkpoint chain (ADR-0010 invariant 2: no reclaim with a pending sync). */
+  async #drainCheckpointSyncs() {
+    if (this.ckptSyncChain === undefined) return
+    const t0 = Date.now()
+    await this.ckptSyncChain
+    this.timings.checkpointDrainMs = Date.now() - t0
   }
 
   /** Graceful shutdown (each channel implements its own: quit request/signal -> timeout fallback; flush external wiring when publish did not run). */
@@ -568,14 +701,18 @@ export class Foreman {
 
     // Git closure: this round's commit (after secret interception) + the
     // authoritative change set since the baseline + uncommitted residue.
-    // Checkpoint mode: the commit is registered into the local chain by turn
-    // number (oids map, feeding incremental pack diffs)
+    // Checkpoint mode: turns were already committed per prompt (ADR-0010 3a);
+    // the collect-time commit remains only for runs without a completed turn
+    // (zero-prompt runs and non-checkpoint flows).
     if (this.git !== undefined) {
-      if (this.ckpt !== undefined) this.ckpt.turn += 1
-      const turn = await this.git.commitTurn(this.ckpt !== undefined ? `#${this.ckpt.turn}` : this.options.sessionId)
-      if (this.ckpt !== undefined) {
-        const oid = turn.oid ?? (await this.git.git(['rev-parse', 'HEAD']).catch(() => '')).trim()
-        this.ckpt.oids.set(this.ckpt.turn, oid === '' ? undefined : oid)
+      let turn = this.lastTurnCommit
+      if (turn === undefined) {
+        if (this.ckpt !== undefined) this.ckpt.turn += 1
+        turn = await this.git.commitTurn(this.ckpt !== undefined ? `#${this.ckpt.turn}` : this.options.sessionId)
+        if (this.ckpt !== undefined) {
+          const oid = turn.oid ?? (await this.git.git(['rev-parse', 'HEAD']).catch(() => '')).trim()
+          this.ckpt.oids.set(this.ckpt.turn, oid === '' ? undefined : oid)
+        }
       }
       this.gitInfo = {
         baselineOid: this.git.baselineOid,
@@ -604,14 +741,27 @@ export class Foreman {
    * sandbox.
    */
   async publish() {
+    const t0 = Date.now()
     const { agentId, sessionId, controlPlane, secretValues = [] } = this.options
+    // ADR-0010 invariant 2: no reclaim path starts while a background
+    // checkpoint sync is in flight; a failed sync rethrows here (fail loud)
+    await this.#drainCheckpointSyncs()
     await rm(this.artifactsDir, { recursive: true, force: true })
+    await mkdir(this.artifactsDir, { recursive: true })
     const workspaceArchive = join(this.artifactsDir, 'workspace.tar.gz')
-    const packaged = await packageWorkspace(this.workspaceDir, workspaceArchive, { secretValues })
     const sessionsArchive = join(this.artifactsDir, 'sessions.tar.gz')
-    await archiveDirectory(this.sessionRoot, sessionsArchive)
     const tracePath = join(this.artifactsDir, 'trace.jsonl')
-    await writeFile(tracePath, this.traceFrames.map((frame) => JSON.stringify(frame)).join('\n') + '\n')
+    // Packaging runs concurrently (independent sources — ADR-0010 3c). The
+    // session archive excludes harness-owned transient scratch: the harness
+    // process is still alive at publish time and codex keeps mutating
+    // CODEX_HOME/.tmp (in-flight plugin clones), which would fail the archive
+    // with "file changed as we read it" — .tmp is regenerated on demand and
+    // never carries durable session state (ADR-0005).
+    const [packaged] = await Promise.all([
+      packageWorkspace(this.workspaceDir, workspaceArchive, { secretValues }),
+      archiveDirectory(this.sessionRoot, sessionsArchive, { exclude: ['./.tmp'] }),
+      writeFile(tracePath, this.traceFrames.map((frame) => JSON.stringify(frame)).join('\n') + '\n'),
+    ])
 
     const result = {
       agentId,
@@ -630,7 +780,8 @@ export class Foreman {
     await writeFile(join(this.artifactsDir, 'result.json'), JSON.stringify(result, null, 2))
 
     // Checkpoint chain: retention policy -> incremental pack upload/rebuild ->
-    // expired pack deletion -> index update
+    // expired pack deletion -> index update (packs already uploaded by the
+    // background chain are counted as uploaded, never re-uploaded)
     if (this.ckpt !== undefined) {
       this.external.checkpoints = await this.syncCheckpoints()
       result.checkpoints = this.external.checkpoints
@@ -648,25 +799,26 @@ export class Foreman {
     result.eventBus = this.busStats
     await writeFile(join(this.artifactsDir, 'result.json'), JSON.stringify(result, null, 2))
 
+    // The artifact batch uploads concurrently (independent objects —
+    // ADR-0010 3c)
     const uploads = [
       ['result.json', await readFile(join(this.artifactsDir, 'result.json'))],
       ['workspace.tar.gz', await readFile(workspaceArchive)],
       ['sessions.tar.gz', await readFile(sessionsArchive)],
       ['trace.jsonl', await readFile(tracePath)],
     ]
-    for (const [name, buffer] of uploads) {
+    await Promise.all(uploads.map(async ([name, buffer]) => {
       await uploadArtifact(controlPlane, agentId, `${sessionId}/${name}`, buffer)
-    }
+    }))
     // Snapshot sink: when configured, the same batch of artifacts is sent
     // through the storage abstraction (credentials resolved dynamically from
     // env on each call)
     if (this.options.snapshot !== undefined) {
       const sink = createSnapshotSink(this.options.snapshot)
-      this.external.snapshotUploads = []
-      for (const [name, buffer] of uploads) {
+      this.external.snapshotUploads = await Promise.all(uploads.map(async ([name, buffer]) => {
         const { url } = await sink.put(`${sessionId}/${name}`, buffer)
-        this.external.snapshotUploads.push({ key: `${sessionId}/${name}`, url })
-      }
+        return { key: `${sessionId}/${name}`, url }
+      }))
     }
 
     await publishBusEvent(controlPlane, {
@@ -685,6 +837,7 @@ export class Foreman {
       artifacts: uploads.map(([name]) => `${sessionId}/${name}`),
     })
     this.phase = 'published'
+    this.timings.publishMs = Date.now() - t0
     return { ...packaged, result, external: this.external }
   }
 
@@ -711,6 +864,11 @@ export class Foreman {
     const rebaseAfter = this.options.checkpoints?.rebaseAfter ?? 0
     let rebasedAt = rebasedAtBefore
     let desired
+    if (currentTurn === 0) {
+      // no completed turn this run: the chain state is exactly what was
+      // restored — nothing to plan, nothing to upload, nothing to drop
+      return { turn: 0, rebasedAt: rebasedAtBefore, ...stats, packs: index.packs }
+    }
     if (rebaseAfter > 0 && currentTurn - rebasedAtBefore >= rebaseAfter) {
       rebasedAt = currentTurn
       desired = [{ turn: currentTurn, from: null }]
@@ -732,17 +890,25 @@ export class Foreman {
     for (const entry of desired) {
       const existing = index.packs.find((pack) => pack.turn === entry.turn)
       if (existing !== undefined && existing.from === entry.from) { stats.kept += 1; continue }
+      if (this.ckptPreloaded.get(entry.turn) === entry.from) {
+        // ADR-0010 3a: already built+uploaded by the per-turn background sync
+        // while the next turn executed; counted as uploaded, never re-uploaded
+        stats.uploaded += 1
+        continue
+      }
       const toRef = ckpt.oids.get(entry.turn)
       const fromRef = entry.from === null ? null : ckpt.oids.get(entry.from)
       if (toRef === undefined) throw new Error(`foreman: checkpoint ${String(entry.turn)} commit missing`)
       if (entry.from !== null && fromRef === undefined) {
         throw new Error(`foreman: checkpoint ${String(entry.from)} commit missing`)
       }
+      const packStartedAt = Date.now()
       const packPath = join(this.artifactsDir, packKey(entry.turn))
       await buildChangePack(this.git, {
         fromRef, toRef, fromTurn: entry.from, toTurn: entry.turn, outPath: packPath,
       })
       await uploadArtifact(controlPlane, agentId, `${sessionId}/${packKey(entry.turn)}`, await readFile(packPath))
+      this.ckptSyncRecords.push({ turn: entry.turn, from: entry.from, ms: Date.now() - packStartedAt, phase: 'publish' })
       stats[existing === undefined ? 'uploaded' : 'rebuilt'] += 1
     }
     for (const pack of index.packs) {

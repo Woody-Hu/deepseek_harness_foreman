@@ -302,6 +302,32 @@ test('git-workspace: baseline -> turn commit -> change set -> secret interceptio
   assert.ok((await readFile(join(cwd, 'leak.txt'))).toString().includes('sk-leak'))
 })
 
+test('git-workspace: large files commit (streaming scan, no silent drop) and boundary-spanning secrets are caught', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'git-ws-large-'))
+  await mkdir(cwd, { recursive: true })
+  // Small chunk size so the streaming path (multiple chunks + carry-over) is exercised
+  const git = new GitWorkspace({ cwd, secretValues: ['sk-known-secret-value'], maxScanBytes: 1024 })
+  await git.ensureRepo()
+  await git.commitBaseline()
+
+  // A clean file larger than the chunk size must COMMIT (regression: the old
+  // "oversize -> unstage" rule silently dropped it from history and from
+  // every checkpoint pack — restores lost the file)
+  await writeFile(join(cwd, 'large.bin'), Buffer.alloc(8 * 1024 * 1024, 7))
+  // A secret split across a chunk boundary must still be intercepted (it
+  // starts 4 bytes before the 1024-byte boundary — only the carry-over can
+  // reassemble the match)
+  await writeFile(join(cwd, 'span.txt'), `${'x'.repeat(1020)}sk-boundary-abcdef123456${'x'.repeat(1500)}`)
+  const turn = await git.commitTurn('sess-large')
+  assert.deepEqual(turn.files.sort(), ['large.bin']) // span.txt intercepted, large.bin committed
+  assert.deepEqual(turn.violations.map((v) => v.file), ['span.txt'])
+  assert.deepEqual(turn.violations[0].rules, ['pattern:openai-key'])
+
+  const tree = await git.lsTree('HEAD')
+  assert.ok(tree.includes('large.bin')) // in the tree -> enters checkpoint packs
+  assert.ok(!tree.includes('span.txt'))
+})
+
 test('git-workspace: commitAll returns committed:false when nothing changed', async () => {
   const cwd = await mkdtemp(join(tmpdir(), 'git-ws-empty-'))
   await writeFile(join(cwd, 'a.txt'), 'a\n')

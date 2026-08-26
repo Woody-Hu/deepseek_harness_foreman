@@ -1,25 +1,28 @@
 # Codex Harness app-server channel — Design
 
-This document is the normative design for the Codex Harness integration channel:
-interfaces, data models, and mechanisms. Decisions and rationale live in
-[ADR-0005](../adr/0005-codex-app-server-channel.md); this document specifies
-*how* it is realized.
+Normative design for the Codex Harness integration channel: interfaces, data models,
+mechanisms. Decisions and rationale live in [ADR-0005](../adr/0005-codex-app-server-channel.md).
+All wire shapes below were **verified live against `codex-cli 0.149.1`** (probe client +
+local Responses-API endpoint); they are observations, not aspirations.
 
 ## 1. Overview
 
 ```
-                    ┌────────────────────────────────────────────────────┐
-  Foreman           │ CodexChannel                                      │
-  orchestrator ──▶  │  spawns codex app-server --stdio                  │
-                    │  JSON-RPC 2.0-lite over stdin/stdout (JSONL)      │
-                    │                                                   │
-                    │  initialize → initialized → thread/start          │
+                    ┌──────────────────────────────────────────────────┐
+  Foreman           │ CodexChannel                                     │
+  orchestrator ──▶  │  spawns `codex app-server --stdio`               │
+                    │  JSONL JSON-RPC 2.0-style over stdin/stdout      │
+                    │                                                  │
+                    │  CODEX_HOME/config.toml  ← channel-written        │
+                    │    (model + provider + wire_api="responses")    │
+                    │                                                  │
+                    │  initialize → initialized → thread/start|resume  │
                     │  → turn/start → item/* notifications              │
-                    │  → turn/completed → (next turn or close)          │
-                    │                                                   │
-                    │  onEvent callback → internal frames                │
-                    │  onStatus callback → channel status updates        │
-                    └────────────────────────────────────────────────────┘
+                    │  → turn/completed → (next turn or close)         │
+                    │                                                  │
+                    │  onEvent callback → internal frames               │
+                    │  onStatus callback → thread status                │
+                    └──────────────────────────────────────────────────┘
                               │
                               ▼
                     SseGateway (outbound adapters)
@@ -30,157 +33,147 @@ interfaces, data models, and mechanisms. Decisions and rationale live in
 
 ### 2.1 Subprocess launch
 
-The channel spawns `codex app-server --stdio` (or the configured binary path) as a
-child process:
-
 ```
 const proc = spawn(binary, args, {
   stdio: ['pipe', 'pipe', 'pipe'],
   cwd: workspaceDir,
-  env: { ...process.env, CODEX_HOME, ...modelEnv },
+  env: { ...process.env, CODEX_HOME, [envKey]: apiKey },  // key env-injected only
 })
 ```
 
-- **stdin**: JSON-RPC requests (client → server), one JSON object per line.
-- **stdout**: JSON-RPC responses and notifications (server → client), one JSON object
-  per line.
-- **stderr**: diagnostic logs (never parsed as protocol; forwarded to foreman's logger).
+- **stdin**: client→server requests and notifications, one JSON object per line.
+- **stdout**: server→client responses, notifications, and server-initiated *requests*
+  (e.g. approvals — these carry an `id` and expect a response).
+- **stderr**: diagnostics (kept as a tail for error messages; never parsed).
 
-### 2.2 Line framing
+Messages omit the `"jsonrpc"` version field. Server→client requests are distinguished
+from notifications by the presence of `id` + `method`.
 
-Each message is a complete JSON object on a single line (JSONL). The channel reads
-stdout line-by-line using a readline interface. The recommended max line size is 10 MB
-(per the Codex app-server spec).
+### 2.2 `CODEX_HOME` and model wiring
 
-### 2.3 Transport options
+`CODEX_HOME` is the foreman session root (`<workdir>/.codex`); it holds the thread
+store (resume state) and `config.toml`, which the channel (re)writes at start:
 
-| Option | Flag | Use case |
-|---|---|---|
-| stdio (default) | `--stdio` | Subprocess embedding (v0.136+) |
-| WebSocket | `--listen ws://127.0.0.1:PORT` | Remote dashboard, multiple clients |
-| Unix socket | (no flags) | TUI and internal CLI processes |
+```toml
+model = "<configured model>"
+model_provider = "foreman"
 
-The initial implementation supports only `--stdio`. WebSocket and Unix socket are
-deferred (tracked in the roadmap).
+[model_providers.foreman]
+name = "Foreman"
+base_url = "<modelEnv base url>"
+wire_api = "responses"
+env_key = "FOREMAN_CODEX_API_KEY"   # read from the child env, never persisted
+```
 
-## 3. Protocol lifecycle
+`wire_api` **must** be `responses`: 0.149.1 rejects `chat`
+(`… 'wire_api = "chat"' is no longer supported`). The provider entry is only written
+when an explicit base URL is configured; otherwise codex's built-in default provider
+(OpenAI, `OPENAI_API_KEY`) is used as-is.
+
+## 3. Protocol lifecycle (verified shapes)
 
 ### 3.1 Initialization handshake
 
-Required message order (every connection):
-
 ```
-→ {"id": 0, "method": "initialize", "params": {
-    "clientInfo": { "name": "foreman", "version": "0.1.0" },
-    "capabilities": {}
-  }}
-← {"id": 0, "result": { "serverInfo": { ... } }}
-
-→ {"method": "initialized", "params": {}}
+→ {"id":1,"method":"initialize","params":{"clientInfo":{"name":"foreman","version":"…"},"capabilities":{}}}
+← {"id":1,"result":{"userAgent":"…","codexHome":"…","platformFamily":"…","platformOs":"…"}}
+→ {"method":"initialized","params":{}}
 ```
 
-The `initialized` notification is sent immediately after receiving the `initialize`
-response. The server rejects any request before this handshake completes.
-
-### 3.2 Thread creation
+### 3.2 Thread creation / resume
 
 ```
-→ {"id": 1, "method": "thread/start", "params": {
-    "model": "gpt-5.1-codex",
-    "cwd": "/workspace",
-    "approvalPolicy": "never"
-  }}
-← {"id": 1, "result": { "thread": { "id": "thr_..." } }}
+→ {"id":2,"method":"thread/start","params":{"cwd":"…","approvalPolicy":"never","sandbox":"workspace-write"}}
+← {"id":2,"result":{"thread":{"id":"01a03d3b-…"},"model":"…","modelProvider":"…", …}}
 ```
 
-On session resume (`thread/resume`):
-
-```
-→ {"id": 1, "method": "thread/resume", "params": {
-    "threadId": "thr_...",
-    "cwd": "/workspace"
-  }}
-← {"id": 1, "result": { "thread": { "id": "thr_..." } }}
-```
+- Thread ids are **server-generated UUIDs** — the external `sessionId` cannot be reused
+  as the thread id (unlike the dsh channels). The channel keeps a
+  `sessionId → threadId` mapping at `CODEX_HOME/threads-index.json`, which the session
+  archive/restore path carries across sandboxes.
+- `sandbox` values: `read-only` | `workspace-write` | `danger-full-access` (kebab-case;
+  camelCase is rejected).
+- Resume: `{"method":"thread/resume","params":{"threadId":"…","cwd":"…"}}` — verified
+  across process restarts with a persisted `CODEX_HOME`; the resumed turn's model
+  request carries the full prior history.
 
 ### 3.3 Turn start
 
 ```
-→ {"id": 2, "method": "turn/start", "params": {
-    "threadId": "thr_...",
-    "input": [{ "type": "text", "text": "do the task" }],
-    "cwd": "/workspace"
-  }}
-← {"id": 2, "result": { "turn": { "id": "turn_..." } }}
+→ {"id":3,"method":"turn/start","params":{"threadId":"…","input":[{"type":"text","text":"…"}]}}
+← {"id":3,"result":{"turn":{"id":"…","status":"inProgress"}}}
 ```
 
 ### 3.4 Streaming notifications (server → client, no `id`)
 
-After `turn/start`, the server emits zero or more notifications on stdout:
+Observed sequence for a tool turn (in order):
 
 ```
-← {"method": "item/started", "params": { "item": { "id": "item_...", "type": "agentMessage", ... } }}
-← {"method": "item/agentMessage/delta", "params": { "itemId": "item_...", "delta": { "type": "text", "text": "Hello" } }}
-← {"method": "item/completed", "params": { "item": { "id": "item_...", "type": "agentMessage", ... } }}
-← {"method": "turn/completed", "params": { "turn": { "id": "turn_...", "status": "completed" } }}
+thread/started
+thread/status/changed        {"threadId":"…","status":{"type":"active"}}
+turn/started                 {"threadId":"…","turn":{"id":"…","status":"inProgress"}}
+item/started                 {"item":{"type":"userMessage", …},"threadId":"…","turnId":"…"}
+item/completed               {"item":{"type":"userMessage", …}, …}
+item/started                 {"item":{"type":"commandExecution","id":"call_1",
+                              "command":"/usr/bin/zsh -lc 'echo probe > probe.txt'",
+                              "cwd":"…","status":"inProgress", …}, …}
+item/completed               {"item":{"type":"commandExecution","id":"call_1",
+                              "status":"completed", …}, …}
+item/started                 {"item":{"type":"agentMessage","id":"msg_1","text":"", …}, …}
+item/agentMessage/delta      {"threadId":"…","turnId":"…","itemId":"msg_1","delta":"SHAPE…"}
+item/completed               {"item":{"type":"agentMessage","id":"msg_1","text":"SHAPE…"}, …}
+thread/status/changed        {"threadId":"…","status":{"type":"idle"}}
+turn/completed               {"threadId":"…","turn":{"id":"…","status":"completed",
+                              "items":[…],"error":null, …}}
 ```
 
-### 3.5 Turn lifecycle
+Other observed notifications (skipped, no mapping): `configWarning`, `warning`,
+`account/rateLimits/updated`, `remoteControl/status/changed`, `thread/goal/cleared`.
 
-```
-turn/start
-  → item/started (agentMessage)
-  → item/agentMessage/delta (text)   [zero or more]
-  → item/agentMessage/delta (text)
-  → item/completed (agentMessage)
-  → item/started (toolUse)
-  → item/toolUse/delta
-  → item/completed (toolUse)
-  → item/started (toolResult)
-  → item/completed (toolResult)
-  → turn/completed
-```
+Item types observed: `userMessage`, `commandExecution`, `agentMessage`. Codex also
+defines `fileChange`, `mcpToolCall`, `webSearch`, `todoList`, `reasoning`, `error` —
+unmapped item types are skipped resiliently (registry-style forward compatibility).
+
+### 3.5 Model endpoint contract
+
+The endpoint must speak the OpenAI **Responses API** (`POST <base_url>/responses`,
+SSE): `response.output_item.added` / `response.function_call_arguments.delta|done` /
+`response.output_text.delta` / `response.output_item.done` / `response.completed`.
+Tool calls reference codex tools by name (`exec_command`, `write_stdin`,
+`update_plan`, `request_user_input`, `view_image`, …); the verified minimal tool
+arguments for `exec_command` are `{cmd: string, timeout_ms: number}`.
 
 ## 4. Internal frame mapping
 
-Each Codex notification is mapped to the internal frame model that the outbound
-protocol adapters consume.
-
-### 4.1 Item types
-
-| Codex notification | Internal frame | Notes |
+| Codex notification | Internal frame | data |
 |---|---|---|
-| `item/agentMessage/delta` (text) | `assistant/chunk` | `data.chunk.text = delta.text` |
-| `item/agentMessage/complete` (no prior deltas) | `assistant/message` | Fallback for replay-derived messages |
-| `item/toolUse/started` | `tool/call` | `data.name`, `data.arguments`, `data.callId` |
-| `item/toolResult/started` | `tool/result` | `data.callId`, `data.meta.diffs` |
-| `item/approval/requested` | `approval/requested` | Web channel HITL equivalent |
-| `item/approval/resolved` | `approval/resolved` | Web channel HITL equivalent |
-| `turn/completed` | `turn/end` | `data.reason.kind` from `status` field |
+| `item/agentMessage/delta` | `assistant/chunk` | `{turn, step, chunk:{type:'text-delta', index:0, text: delta}}` (`delta` is a plain string) |
+| `item/completed` (`agentMessage`) | `assistant/message` | `{turn, step, message:{content:[{type:'text', text: item.text}]}}` |
+| `item/started` (`commandExecution`) | `tool/call` | `{name:'exec_command', arguments:{command: item.command}, callId: item.id}` |
+| `item/completed` (`commandExecution`) | `tool/result` | `{callId: item.id, meta:{diffs:[]}}` |
+| `turn/completed` | `turn/end` | `{reason:{kind: status→completed\|failed\|cancelled}}` |
+| `thread/status/changed` | `onStatus` | `{sessionId, status: 'active'\|'idle'}` |
 
-### 4.2 Turn identity
+Turn/step numbers are channel-local counters (one `prompt()` = one turn).
 
-The Codex `turn_id` maps to the internal `turn` number (monotonically increasing per
-thread). The external `sessionId` = `thread_id` (same as the dsh channels use
-`sessionId` as the dsh session id).
+## 5. Channel interface
 
-## 5. Session resume
+Same contract as the dsh channels (consumed by foreman.js):
 
-The Codex channel supports session resume via `thread/resume`:
+```
+start({onEvent, onStatus}) → {threadId}          // handshake + thread start/resume
+prompt(sessionId, text, {timeoutMs}) → {reason}  // turn/start … turn/completed
+shutdown() → exitCode                            // stdin close → SIGTERM → SIGKILL
+kill() → exitCode                                // immediate SIGKILL
+sessionRoot → CODEX_HOME
+```
 
-1. `prepare()` downloads the persisted session data (JSONL files from the Codex
-   thread store) and restores them to `CODEX_HOME/threads/`.
-2. `start()` calls `thread/resume` with the stored `threadId` instead of
-   `thread/start`.
-3. The Codex app-server reloads the thread history from the local store and
-   continues the conversation.
-
-This requires the `CODEX_HOME` directory to be persisted across runs (stored in
-the workspace or session archive).
+Timeouts: `prompt()` rejects after `timeoutMs` and best-effort sends `turn/interrupt`.
 
 ## 6. Configuration
 
-The `CodexChannel` options are nested under `harness.codex` in the foreman config:
+Selected via `foreman.config.json` → `harness.channel: "codex"` (or the `channel`
+constructor option). Full option surface (ADR-0002 validation rules apply):
 
 ```json
 {
@@ -190,38 +183,31 @@ The `CodexChannel` options are nested under `harness.codex` in the foreman confi
       "binary": "codex",
       "args": ["app-server", "--stdio"],
       "model": "gpt-5.1-codex",
+      "provider": { "name": "foreman", "baseUrl": "…", "envKey": "FOREMAN_CODEX_API_KEY" },
       "approvalPolicy": "never",
+      "sandbox": "workspace-write",
       "timeoutMs": 300000
     }
   }
 }
 ```
 
-The `Foreman` constructor passes these through to `CodexChannel` when
-`channel === 'codex'`.
+Runtime overrides (constructor options, same precedence rules): `modelEnv.CODEX_API_KEY`
+/ `modelEnv.CODEX_BASE_URL` — env-injected into the child process only, never written
+to disk (`config.toml` stores the env var *name*, not the value).
 
 ## 7. Error handling
 
-### 7.1 Protocol errors
+- JSON-RPC error responses reject the pending request promise (code + message in the
+  error string; `stderrTail` is appended for turn failures).
+- Subprocess exit while a turn is pending rejects the pending prompt.
+- `shutdown()` is a graceful drain (stdin close, 15 s) with SIGTERM (10 s) and SIGKILL
+  fallbacks, matching the other channels' behavior.
 
-JSON-RPC error responses are mapped to channel errors:
+## 8. Testing strategy
 
-```json
-← { "id": 2, "error": { "code": -32603, "message": "Internal error" } }
-```
-
-- `code` -32603 (Internal error): retryable (turn is abandoned, channel is still valid).
-- `code` -32000 (Not initialized): fatal (channel must be restarted).
-- `code` -32601 (Method not found): fatal (wrong Codex version or binary).
-
-### 7.2 Timeout
-
-If `turn/start` does not receive a `turn/completed` within `timeoutMs`, the channel
-sends `turn/interrupt` (if available) or kills the subprocess. The prompt promise
-rejects with a timeout error.
-
-### 7.3 Subprocess crash
-
-If the `codex` subprocess exits unexpectedly, the channel sets the status to
-`crashed` and rejects any pending prompt promise. `shutdown()` returns the exit code.
-`publish()` still archives whatever state was collected.
+Per ADR-0008: the channel is tested end-to-end against the **real** `codex` binary
+with a local Responses-API fixture endpoint (a scripted external dependency, same
+pattern as the dsh tests' mock model) and a real local control plane. See
+`test/e2e/codex.e2e.js` — cold start, tool execution, streaming frame mapping, session
+resume across sandboxes, artifact publication. No part of foreman itself is mocked.

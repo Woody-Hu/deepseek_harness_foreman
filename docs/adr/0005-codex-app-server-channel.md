@@ -1,105 +1,96 @@
 # ADR-0005: Codex Harness app-server integration channel
 
-**Status:** Proposed
-**Date:** 2026-08-25
+**Status:** Accepted (supersedes the initial Proposed draft — the speculative protocol
+shapes have been replaced with live-verified ones, see below)
+**Date:** 2026-08-25 · revised 2026-08-26
 
 ## Context
 
-Foreman currently supports two harness channels — `stdio` (SDK JSON-RPC over NDJSON)
-and `web` (dsh web apiproxy over HTTP+WebSocket) — both targeting the DeepSeek Harness
-(dsh) runtime. The protocol adapter layer (ADR-0001, ADR-0003) already handles the
-*outbound* event stream for the Codex product line (`openai-responses`/`codex` dialect),
-but there is no *inbound* channel that can drive a Codex Harness agent session directly.
+Foreman supported two harness channels — `dsh-sdk` (SDK JSON-RPC over NDJSON stdio)
+and `dsh-web` (dsh web apiproxy over HTTP+WebSocket) — both targeting the DeepSeek
+Harness (dsh) runtime. The protocol adapter layer (ADR-0001, ADR-0003) already handles
+the *outbound* event stream for the Codex product line (`openai-responses`/`codex`
+dialect), but there was no *inbound* channel that can drive a Codex Harness agent
+session directly.
 
-The [Codex Harness](https://github.com/openai/codex) was fully open-sourced on
-2026-08-19 (Apache-2.0). Its `codex app-server` exposes a bidirectional JSON-RPC 2.0
-protocol (with the `"jsonrpc":"2.0"` header omitted on the wire) over stdio, WebSocket,
-or Unix socket. The protocol defines three core primitives — **Thread**, **Turn**, **Item**
-— and a lifecycle handshake (`initialize` → `initialized` → `thread/start` → `turn/start`
-→ streaming notifications → `turn/completed`).
+The [Codex Harness](https://github.com/openai/codex) `codex app-server` exposes a
+JSON-RPC 2.0-style protocol over stdio JSONL (`--stdio` flag). Foreman must be able to
+drive a Codex Harness agent as a first-class channel, sharing the same orchestrator
+(`prepare`/`start`/`prompt`/`collect`/`publish`), workspace checkpointing, secret
+interception, and outbound event adaptation that the dsh channels use.
 
-Foreman must be able to drive a Codex Harness agent as a first-class channel, sharing
-the same orchestrator (`prepare`/`start`/`prompt`/`collect`/`publish`), workspace
-checkpointing, secret interception, and outbound event adaptation that the existing dsh
-channels use.
+**Verification method.** The protocol was verified live against `codex-cli 0.149.1`
+with a probe client plus a local Responses-API endpoint: initialize handshake,
+thread/turn lifecycle, tool execution (`exec_command`), streaming notification shapes,
+cross-process session resume, and multi-turn history growth. The normative shapes are
+recorded in [docs/design/codex-channel.md](../design/codex-channel.md).
 
 ## Options considered
 
 1. **Map the Codex app-server protocol onto the existing `SdkChannel` abstraction** —
-   the SDK channel already speaks NDJSON over stdio; the Codex app-server also speaks
-   JSONL over stdio (`--stdio` flag, or the default Unix socket). The message schema and
-   lifecycle differ significantly (dsh uses `session.create` / `agents.create` /
-   `session.event` notifications; Codex uses `thread/start` / `turn/start` /
-   `item/*` notifications), so a shared implementation would be tangled in conditionals.
-   Rejected: the lifecycle differences are too deep.
-
-2. **New channel class `CodexChannel` implementing the same interface as `SdkChannel`
-   and `WebChannel`** (chosen) — the channel interface (`start`, `prompt`, `shutdown`,
-   `kill`) is already abstract enough; a new channel class maps the Codex app-server
-   handshake, turn lifecycle, and event stream onto the same `onEvent`/`onStatus`
-   callbacks. The channel is selected by `channel: 'codex'`.
-
-3. **Wrap the Codex SDK (`@openai/codex-sdk`)** — the SDK provides a higher-level
-   `CodexAgent` class. This would add a non-trivial dependency (the SDK is published on
-   npm). The raw JSON-RPC protocol is well-documented and stable, and embedding it
-   directly avoids version coupling and SDK-specific error handling. Rejected: prefer
-   the raw protocol for the same reasons the existing dsh channels use the raw SDK
-   protocol rather than a higher-level wrapper.
+   both speak JSONL over stdio, but the lifecycles differ deeply (dsh:
+   `session.create`/`agents.create`/`session.event`; Codex: `thread/start`/`turn/start`
+   + `item/*` notifications, plus a config-file-driven model provider model). A shared
+   implementation would be tangled in conditionals. Rejected.
+2. **New channel class `CodexChannel` implementing the same channel interface** (chosen) —
+   the channel interface (`start`, `prompt`, `shutdown`, `kill`) is already abstract
+   enough; a new class maps the Codex lifecycle onto the same `onEvent`/`onStatus`
+   callbacks. Selected by `channel: 'codex'` (ADR-0009 names channels after their
+   harness).
+3. **Wrap the Codex SDK** — adds an npm dependency and version coupling; the raw
+   protocol is small and verified. Rejected, consistent with why the dsh channels use
+   the raw protocol.
 
 ## Decision
 
 ### 1. New channel: `src/channels/codex-channel.js`
 
-A new channel class `CodexChannel` with the same interface as `SdkChannel`:
+`CodexChannel` implements the common channel interface and speaks the verified v2
+app-server protocol:
 
-```
-start({ onEvent, onStatus }) → Promise<{ sessionId: string, ... }>
-prompt(sessionId, text, { timeoutMs }) → Promise<{ reason: { kind: string } }>
-shutdown() → Promise<number>  // exit code
-kill() → Promise<number>
-```
+- Spawns `codex app-server --stdio` (binary/args configurable).
+- **Model wiring goes through `CODEX_HOME/config.toml`**, not through request params:
+  the channel writes a `model_providers.foreman` entry (base URL + `wire_api =
+  "responses"`; 0.149.1 rejects `wire_api = "chat"`) and reads the API key from a
+  fixed env var — credentials stay env-injected, never on disk. Note this means the
+  model endpoint must speak the OpenAI **Responses API** wire format (DeepSeek's
+  chat-completions endpoint is therefore not directly usable behind codex ≥0.149
+  without a translating gateway).
+- Handshake: `initialize` → `initialized` → `thread/start {cwd, approvalPolicy,
+  sandbox}` (or `thread/resume {threadId, cwd}` when the persisted thread store
+  exists).
+- `prompt()` sends `turn/start {threadId, input:[{type:'text',text}]}` and resolves on
+  `turn/completed`.
+- `shutdown()` closes stdin (graceful) with SIGTERM/SIGKILL fallbacks; `kill()` is an
+  immediate SIGKILL.
 
-The channel:
+### 2. Internal frame mapping (verified shapes)
 
-- Spawns `codex app-server --stdio` as a subprocess (or uses the path from
-  configuration).
-- Performs the initialization handshake: `initialize` request → `initialized`
-  notification.
-- Calls `thread/start` to create a new thread (or `thread/resume` when continuing
-  a persisted session).
-- On `prompt()`, calls `turn/start` with the user text and streams `item/*`
-  notifications from stdout, converting them into the same internal frame model
-  (`{ kind: 'session.event', type, data }`) that the outbound protocol adapters
-  consume.
-- On `turn/completed`, resolves the prompt promise.
-- `shutdown()` sends no request (the subprocess exits when stdin closes); `kill()`
-  sends SIGKILL.
-
-### 2. Internal frame mapping
-
-Codex app-server notifications are mapped to the internal frame model:
-
-| Codex notification | Internal frame type | data shape |
+| Codex notification | Internal frame | Notes |
 |---|---|---|
-| `item/agentMessage/delta` | `assistant/chunk` | `{ turn, step, chunk: { type:'text-delta', index, text } }` |
-| `item/agentMessage/complete` (when no deltas arrived) | `assistant/message` | `{ turn, step, message: { content: [...] } }` |
-| `item/toolUse/started` | `tool/call` | `{ name, arguments, callId }` |
-| `item/toolResult/started` | `tool/result` | `{ callId, meta: { diffs: [] } }` |
-| `turn/completed` | `turn/end` | `{ reason: { kind: 'completed' \| error \| cancelled } }` |
-| `item/approval/requested` | `approval/requested` | `{ sessionId, approvalId, toolName, reason }` |
-| `item/approval/resolved` | `approval/resolved` | `{ sessionId, approvalId, outcome }` |
+| `item/agentMessage/delta` | `assistant/chunk` | `params.delta` is a plain string |
+| `item/completed` (`item.type === 'agentMessage'`) | `assistant/message` | text in `item.text` |
+| `item/started` (`item.type === 'commandExecution'`) | `tool/call` | `arguments.command` from `item.command` |
+| `item/completed` (`item.type === 'commandExecution'`) | `tool/result` | `callId = item.id` |
+| `turn/completed` | `turn/end` | `reason.kind` from `turn.status` |
+| `thread/status/changed` | `onStatus` | active/idle |
+
+Unknown notifications (e.g. `configWarning`, `account/rateLimits/updated`) are skipped
+resiliently. Full shapes: [docs/design/codex-channel.md](../design/codex-channel.md).
 
 ### 3. Session identity and resume
 
-The Codex `thread_id` doubles as the external `sessionId` (same pattern as the dsh
-channels). `thread/resume` is called during `prepare()` when session logs exist for
-the given sessionId.
+Codex generates its own thread ids (UUIDs), so — unlike the dsh channels — the external
+`sessionId` cannot double as the harness session id. The channel persists a
+`sessionId → threadId` mapping inside `CODEX_HOME` (`threads-index.json`), which lives
+under the foreman session root and is therefore archived/restored with the run's
+session logs; `prepare()` → restore → `thread/resume` continues the conversation
+across sandboxes (verified across process restarts).
 
 ### 4. Config-driven channel selection
 
-The `channel` option in `Foreman` constructor accepts `'codex'` in addition to
-`'stdio'` and `'web'`. The `foreman.config.json` schema (ADR-0002) is extended with
-a `channel` key under a new `harness` namespace:
+`foreman.config.json` gains a `harness` namespace (ADR-0002 rules: unknown keys fail
+loud; precedence constructor option > config file > default):
 
 ```json
 {
@@ -107,9 +98,10 @@ a `channel` key under a new `harness` namespace:
     "channel": "codex",
     "codex": {
       "binary": "codex",
-      "args": ["app-server", "--stdio"],
       "model": "gpt-5.1-codex",
-      "approvalPolicy": "never"
+      "provider": { "name": "foreman", "baseUrl": "...", "envKey": "FOREMAN_CODEX_API_KEY" },
+      "approvalPolicy": "never",
+      "sandbox": "workspace-write"
     }
   }
 }
@@ -117,22 +109,19 @@ a `channel` key under a new `harness` namespace:
 
 ### 5. Outbound event adaptation
 
-The Codex channel reuses the existing outbound protocol adapter layer. The same
-`native` / `openai-chat` / `openai-responses` / `anthropic-messages` adapters are
-available regardless of the inbound channel. The `openai-responses` (codex) adapter
-is the natural choice for Codex consumers, but the decision is deployment-configurable
-(ADR-0002).
+Unchanged from the other channels: the internal frames flow into the existing
+adapter registry (`native` / `openai-chat` / `openai-responses` / `anthropic-messages`),
+selected per run (ADR-0002).
 
 ## Consequences
 
-- Foreman can drive a Codex Harness agent session as a first-class channel, with the
-  same orchestrator lifecycle, workspace checkpointing, and secret interception.
-- The new channel adds ~400 lines of implementation and ~200 lines of tests.
-- The `codex` binary must be available in the sandbox PATH (or configured via
-  `harness.codex.binary`). This is an operational dependency, not a code dependency.
-- The Codex app-server protocol is evolving (experimental WebSocket transport, new
-  item types); the channel implementation should be resilient to unknown item types
-  (skip them with a warning, same as the protocol adapters handle unknown frame types).
-- Session resume via `thread/resume` requires the Codex app-server to have access to
-  the persisted thread store (shared `CODEX_HOME` across runs, stored in the workspace
-  or session archive).
+- Foreman drives a Codex Harness agent as a first-class channel with the same
+  orchestrator lifecycle, workspace checkpointing, and secret interception.
+- The `codex` binary must be available in the sandbox PATH (operational dependency).
+- The channel requires a Responses-API-compatible model endpoint (codex ≥0.149 dropped
+  chat-completions wire support); deployments aiming DeepSeek models at codex need a
+  translating gateway — recorded as a capability boundary in the roadmap.
+- Session resume requires the persisted `CODEX_HOME` (thread store + id mapping),
+  carried by the existing `sessions.tar.gz` archive/restore path.
+- HITL approval requests (server→client requests) are auto-accepted for now
+  (`approvalPolicy: 'never'` in tests); full HITL forwarding is a roadmap item.

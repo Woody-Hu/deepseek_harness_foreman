@@ -11,10 +11,12 @@ edited in place after acceptance.
 | [0002](0002-runner-config-file.md) | Runner configuration file and protocol selection | Accepted |
 | [0003](0003-openai-responses-protocol.md) | `openai-responses` protocol dialect (Codex) | Accepted |
 | [0004](0004-hermetic-tests-and-benchmarks.md) | Hermetic testing and benchmarking strategy | Accepted |
-| [0005](0005-codex-app-server-channel.md) | Codex Harness app-server integration channel | Proposed |
+| [0005](0005-codex-app-server-channel.md) | Codex Harness app-server integration channel | Accepted |
 | [0006](0006-anthropic-messages-protocol.md) | Anthropic Messages streaming protocol adapter (Claude Code) | Proposed |
 | [0007](0007-inbound-protocol-adaptation.md) | Inbound protocol adaptation (generalized parse direction) | Proposed |
 | [0008](0008-harness-protocol-testing-and-benchmarks.md) | Independent testing and benchmark strategy for harness protocols | Proposed |
+| [0009](0009-channel-naming.md) | Harness-scoped channel naming (`dsh-sdk` / `dsh-web` / `codex`) | Accepted |
+| [0010](0010-overlap-scheduling.md) | Overlap scheduling for run-lifecycle I/O | Accepted |
 
 ## Process
 

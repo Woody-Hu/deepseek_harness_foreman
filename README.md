@@ -7,16 +7,18 @@ traces to the cloud in real time, intercepts secrets before anything leaves the 
 publishes the run's artifacts back to storage — so the system can reclaim the sandbox at any
 moment without losing state.
 
-Foreman supports multiple harness backends (DeepSeek Harness stdio/web channels, **Codex
-Harness app-server** via ADR-0005) and multiple outbound event protocols (native,
-OpenAI Chat Completions, OpenAI Responses/Codex, **Anthropic Messages/Claude** via ADR-0006),
-all selected via configuration file with no code changes.
+Foreman supports multiple harness backends (DeepSeek Harness `dsh-sdk` / `dsh-web` channels,
+**Codex Harness app-server** via ADR-0005, harness-scoped naming per ADR-0009) and multiple
+outbound event protocols (native, OpenAI Chat Completions, OpenAI Responses/Codex,
+**Anthropic Messages/Claude** via ADR-0006), all selected via configuration file with no
+code changes.
 
 ## Feature highlights
 
-- **Multi-harness channels** — drive DeepSeek Harness (stdio JSON-RPC, web apiproxy) or
-  Codex Harness (app-server JSON-RPC over stdio) with the same orchestrator. The channel
-  is selected per run via configuration.
+- **Multi-harness channels** — drive DeepSeek Harness (`dsh-sdk`: SDK JSON-RPC over NDJSON
+  stdio; `dsh-web`: web apiproxy) or Codex Harness (`codex`: app-server JSON-RPC over stdio)
+  with the same orchestrator. The channel is selected per run via configuration; channel ids
+  are harness-scoped (ADR-0009), with legacy `stdio`/`web` aliases accepted.
 - **Cross-sandbox session resume** — the external session id doubles as the harness session id.
   Session logs are archived per run and restored on the next `prepare()`, so a new sandbox
   continues the conversation with full history (workspace absolute paths must match — cloud
@@ -25,6 +27,11 @@ all selected via configuration file with no code changes.
   incremental change packs ("full first pack + incremental pack chain"). A skip-list-style
   tiered retention policy balances pack count against pack size, and periodic rebaselines
   bound the restore chain length. See [docs/checkpoint-design.md](docs/checkpoint-design.md).
+- **Overlap scheduling (ADR-0010)** — checkpoint packs are built and uploaded in the
+  background while the next turn executes; workspace packs, session archives, and publish
+  artifacts transfer concurrently. Measured on the real codex channel (5 turns × 8 MiB):
+  2 065 ms less sandbox occupancy per run (12.1%), matching the critical-path projection
+  (85% fidelity). See [bench/run-pipeline.bench.js](bench/run-pipeline.bench.js).
 - **Secret interception, three layers** — path exclusion (`.env` and friends never packaged),
   content masking (`[REDACTED]` replaces secret values in packaged files and forwarded event
   streams), and git pre-commit scanning (secret-looking files are unstaged — they stay out of
@@ -48,11 +55,14 @@ all selected via configuration file with no code changes.
 
 ## Channels
 
+Canonical channel ids are harness-scoped (ADR-0009); legacy aliases `stdio` / `web` are
+accepted and map to `dsh-sdk` / `dsh-web`.
+
 | Channel | Transport | Harness | Session resume | HITL |
 |---|---|---|---|---|
-| `stdio` | SDK JSON-RPC over NDJSON stdio | DeepSeek Harness | via the bundled resume-adapter plugin | — |
-| `web` | dsh web apiproxy (HTTP + WebSocket) | DeepSeek Harness | native (cold persisted sessions) | full support |
-| `codex` | JSON-RPC 2.0-lite over stdio JSONL | Codex Harness app-server | via `thread/resume` | planned |
+| `dsh-sdk` | SDK JSON-RPC over NDJSON stdio | DeepSeek Harness | via the bundled resume-adapter plugin | — |
+| `dsh-web` | dsh web apiproxy (HTTP + WebSocket) | DeepSeek Harness | native (cold persisted sessions) | full support |
+| `codex` | JSON-RPC 2.0-lite over stdio JSONL | Codex Harness app-server | via `thread/resume` (verified against codex-cli 0.149.1) | planned |
 
 All channels share one `Foreman` orchestrator; the composition config (`cordis.yml` /
 `web-patch.yml` / `foreman.config.json`) is owned by the cloud and delivered through object
@@ -93,6 +103,7 @@ solution/
     telemetry-enrich.mjs  deployment-side telemetry attribute pipeline (rule table)
   bench/
     protocol.bench.js     protocol pipeline benchmark (real loopback HTTP, no mocks)
+    run-pipeline.bench.js overlap-scheduling A/B benchmark on a real run (ADR-0010)
   test/
     unit.test.js          unit tests (retention, redaction, formats, packs, bus, sink)
     protocols.test.js     golden-transcript conformance tests for every adapter
@@ -101,6 +112,7 @@ solution/
     channels/             channel integration tests
       codex-channel.test.js
     e2e/                  end-to-end scenarios (see below)
+    fixtures/             scripted harness fixtures (codex Responses endpoint)
     mocks/                mock control plane / model / OTLP collector
   cordis.yml              stdio-channel composition (cloud-owned)
   web-patch.yml           web-channel patch overlay (cloud-owned)
@@ -116,14 +128,18 @@ Requirements: Node.js >= 22.19, a built harness repository, and the `git` binary
 pnpm test                 # unit + protocol conformance + wire tests
 pnpm run bench            # protocol pipeline benchmark (real loopback HTTP)
 pnpm run bench:quick      # same, smaller workload
-pnpm test:e2e:basic       # cold start + session resume (stdio channel)
-pnpm test:e2e:web         # HITL approvals + crash/dangling-approval recovery (web channel)
+pnpm run bench:pipeline   # overlap-scheduling A/B benchmark (ADR-0010; real codex channel)
+pnpm test:e2e:basic       # cold start + session resume (dsh-sdk channel)
+pnpm test:e2e:web         # HITL approvals + crash/dangling-approval recovery (dsh-web channel)
 pnpm test:e2e:cloud       # trace shipping, snapshot sink, event bus, format adaptation
 pnpm test:e2e:checkpoint  # 7-round incremental checkpoint chain + retention + rebase
+pnpm test:e2e:codex       # cold start + cross-sandbox resume (codex channel)
 ```
 
 All tests are keyless: they run against in-process mocks of the model endpoint, the control
-plane, and the OTLP collector.
+plane, and the OTLP collector. The dsh e2e scenarios additionally require the harness
+repository checkout one level above this one; the codex e2e only needs the `codex` binary
+(codex-cli) in PATH and is otherwise self-contained.
 
 ### Protocol selection via config file
 
@@ -164,8 +180,9 @@ The inbound harness channel is selected per run via configuration (ADR-0005):
 }
 ```
 
-`harness.channel` accepts `'stdio'` (default, DeepSeek Harness), `'web'` (DeepSeek Harness
-web apiproxy), or `'codex'` (Codex Harness app-server).
+`harness.channel` accepts `'dsh-sdk'` (default, DeepSeek Harness SDK), `'dsh-web'`
+(DeepSeek Harness web apiproxy), or `'codex'` (Codex Harness app-server); legacy aliases
+`'stdio'` / `'web'` remain accepted (ADR-0009).
 
 ### Driving the runner programmatically
 
@@ -175,7 +192,7 @@ import { Foreman } from '@deepseek-ai/foreman'
 const foreman = new Foreman({
   repoRoot,                          // harness repository root
   workdir,                           // isolated run directory (fixed path across runs)
-  channel: 'web',                    // or 'stdio', 'codex'
+  channel: 'dsh-web',                // or 'dsh-sdk', 'codex' (legacy: 'stdio', 'web')
   agentId, sessionId,                // object-storage coordinates + session identity
   modelEnv: { DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL },  // env-injected only
   controlPlane: { baseUrl },         // artifact storage + message bus
@@ -233,6 +250,10 @@ a matter of writing a single module.
     (generalized parse direction).
   - [ADR-0008](docs/adr/0008-harness-protocol-testing-and-benchmarks.md) — independent
     testing and benchmark strategy for harness protocols.
+  - [ADR-0009](docs/adr/0009-channel-naming.md) — harness-scoped channel naming
+    (`dsh-sdk` / `dsh-web` / `codex`).
+  - [ADR-0010](docs/adr/0010-overlap-scheduling.md) — overlap scheduling for run-lifecycle
+    I/O, with the critical-path model and measured verification.
 
 ## License
 

@@ -1,426 +1,394 @@
 /**
  * Codex Harness app-server channel driver: launches `codex app-server --stdio`
- * and communicates over JSON-RPC 2.0-lite over JSONL (stdin/stdout).
+ * and speaks the v2 app-server protocol over JSONL (ADR-0005,
+ * docs/design/codex-channel.md — all wire shapes live-verified against
+ * codex-cli 0.149.1).
  *
- * Implements the same channel interface as SdkChannel and WebChannel, consumed
- * by foreman.js:
- *   start(handlers) -> handshake result
+ * Channel interface (same contract as SdkChannel / WebChannel):
+ *   start({ onEvent, onStatus }) -> { threadId }
  *   prompt(sessionId, text, opts) -> { reason }
- *   shutdown() -> exitCode
- *   kill() -> exitCode
+ *   shutdown() -> exitCode    kill() -> exitCode
+ *   sessionRoot -> CODEX_HOME
  *
- * Protocol lifecycle (ADR-0005, docs/design/codex-channel.md):
- *   initialize → initialized → thread/start → turn/start
- *   → item/* notifications → turn/completed → (next turn or close)
+ * Model wiring: codex resolves the model from CODEX_HOME/config.toml, so the
+ * channel (re)writes it at start — a `model_providers.foreman` entry with
+ * wire_api = "responses" (0.149.1 rejects "chat") and env_key pointing at an
+ * env var injected into the child only (secrets never on disk).
  *
- * Session identity: thread_id = external sessionId (no mapping table).
+ * Session identity: codex generates its own thread ids, so the external
+ * sessionId -> threadId mapping is persisted at CODEX_HOME/threads-index.json
+ * (archived/restored with the session logs by foreman); a restored mapping
+ * routes start() through thread/resume.
  */
 import { spawn } from 'node:child_process'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { createInterface } from 'node:readline'
 
-/** Codex app-server boot timeout (cold start with tsx/compiled binary). */
-const BOOT_TIMEOUT_MS = 60_000
+/** Env var name carrying the API key into the codex child process. */
+export const CODEX_API_KEY_ENV = 'FOREMAN_CODEX_API_KEY'
 
-/** JSON-RPC 2.0-lite client for the Codex app-server protocol. */
-class CodexJsonRpcClient {
+/** JSONL JSON-RPC-style client for the codex app-server protocol. */
+class CodexRpcClient {
   constructor(stdout) {
     this.nextId = 1
     this.pending = new Map() // id -> { resolve, reject }
     this.notificationHandlers = []
-    this.lineBuffer = ''
-    this.reader = createInterface({ input: stdout, crlfDelay: Infinity })
-    this.reader.on('line', (line) => {
-      if (!line.trim()) return
-      let message
-      try { message = JSON.parse(line) } catch { return }
-      this.dispatch(message)
+    this.requestHandlers = []
+    let buffer = ''
+    stdout.setEncoding('utf8')
+    stdout.on('data', (chunk) => {
+      buffer += chunk
+      let index
+      while ((index = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, index)
+        buffer = buffer.slice(index + 1)
+        if (line.trim() === '') continue
+        let message
+        try { message = JSON.parse(line) } catch { continue } // non-protocol stderr noise on stdout is skipped
+        this.dispatch(message)
+      }
     })
   }
 
   dispatch(message) {
-    // Response (has id, no method)
     if (message.id !== undefined && message.method === undefined) {
       const waiter = this.pending.get(message.id)
       if (waiter === undefined) return
       this.pending.delete(message.id)
-      if (message.error !== undefined) {
-        waiter.reject(new Error(`codex JSON-RPC ${message.error.code}: ${message.error.message}`))
-      } else {
-        waiter.resolve(message.result)
-      }
+      if (message.error !== undefined) waiter.reject(new Error(`codex ${message.error.code}: ${message.error.message}`))
+      else waiter.resolve(message.result)
       return
     }
-    // Notification (has method, no id) — includes all item/* and turn/* events
-    if (message.method !== undefined) {
-      for (const handler of this.notificationHandlers) {
-        handler(message.method, message.params ?? {})
-      }
+    if (message.method === undefined) return
+    if (message.id !== undefined) {
+      // Server-initiated request (approval requests): handlers answer or a
+      // default decision is sent back.
+      for (const handler of this.requestHandlers) handler(message, this)
+      return
     }
+    for (const handler of this.notificationHandlers) handler(message.method, message.params ?? {})
   }
 
   request(method, params) {
     const id = this.nextId++
     return new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject })
-      this.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`)
+      this.send({ id, method, params })
     })
   }
 
-  /** Send a notification (no response expected). */
-  notify(method, params) {
-    this.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method, params })}\n`)
+  notify(method, params) { this.send({ method, params }) }
+
+  /** Answer a server-initiated request. */
+  respond(id, result) { this.send({ id, result }) }
+
+  send(message) {
+    if (this.stdin === undefined || this.stdin.destroyed) return
+    this.stdin.write(`${JSON.stringify(message)}\n`)
   }
 
   onNotification(handler) { this.notificationHandlers.push(handler) }
+  onRequest(handler) { this.requestHandlers.push(handler) }
+}
 
-  /** Bind stdin after the subprocess is spawned. */
-  bindStdin(stdin) { this.stdin = stdin }
+/** Map codex turn.status to the internal turn/end reason kind. */
+function turnEndReason(status) {
+  if (status === 'completed') return 'completed'
+  if (status === 'cancelled' || status === 'interrupted') return 'cancelled'
+  return 'failed'
 }
 
 /**
  * @param {object} options
- * @param {string} [options.binary] codex binary path (default: 'codex')
- * @param {string[]} [options.args] extra args to the codex app-server (default: ['app-server', '--stdio'])
- * @param {string} options.workspaceDir session workspace (absolute path)
- * @param {string} [options.codexHome] CODEX_HOME directory (persisted thread store; default: join(workspaceDir, '.codex'))
- * @param {string} [options.model] model to use (default: 'gpt-5.1-codex')
- * @param {string} [options.approvalPolicy] approval policy (default: 'never')
- * @param {object} [options.modelEnv] { API_KEY, BASE_URL } — env-injected, never written to disk
- * @param {object} [options.envExtra] extra env entries injected into the child process
- * @param {number} [options.timeoutMs] turn timeout (default: 300000)
+ * @param {string} [options.binary] codex binary (default 'codex')
+ * @param {string[]} [options.args] app-server args (default ['app-server','--stdio'])
+ * @param {string} options.workspaceDir session workspace (absolute; must be identical across runs)
+ * @param {string} [options.codexHome] CODEX_HOME (thread store + config.toml; default <workspaceDir>/.codex)
+ * @param {string} options.sessionId external session id (thread-id mapping key)
+ * @param {string} [options.model] model name written to config.toml (default 'gpt-5.1-codex')
+ * @param {object} [options.provider] custom model provider { name, baseUrl, envKey }
+ * @param {string} [options.apiKey] API key injected via env (CODEX_API_KEY_ENV) — never written to disk
+ * @param {string} [options.baseUrl] model endpoint base URL (overrides provider.baseUrl); requires Responses-API wire
+ * @param {string} [options.approvalPolicy] default 'never'
+ * @param {string} [options.sandbox] 'read-only' | 'workspace-write' | 'danger-full-access'
+ * @param {number} [options.timeoutMs] turn timeout (default 300000)
+ * @param {object} [options.envExtra] extra env injected into the child process
  */
 export class CodexChannel {
-  constructor(options) {
+  constructor(options = {}) {
+    // undefined values must not override the defaults (callers pass sparse option objects)
+    const provided = Object.fromEntries(Object.entries(options).filter(([, value]) => value !== undefined))
     this.options = {
       binary: 'codex',
       args: ['app-server', '--stdio'],
       model: 'gpt-5.1-codex',
       approvalPolicy: 'never',
+      sandbox: 'workspace-write',
       timeoutMs: 300_000,
-      ...options,
+      ...provided,
     }
     this.events = []
     this.timings = {}
-    this.threadId = undefined
     this.phase = 'constructed'
+    this.sessionId = options.sessionId ?? 'unknown'
+    this.turnNumber = 0
+    this.stepNumber = 0
+    this.seq = 0
+    this.threadId = undefined
+    this.stderrTail = ''
   }
 
-  get sessionRoot() {
-    // Codex stores thread data in CODEX_HOME/threads/
-    return this.options.codexHome ?? join(this.options.workspaceDir, '.codex')
+  get sessionRoot() { return this.options.codexHome ?? join(this.options.workspaceDir, '.codex') }
+
+  /**
+   * Write CODEX_HOME/config.toml (model + provider; the API key stays in env).
+   *
+   * Codex appends `[projects."<path>"] trust_level = "trusted"` entries to this
+   * file at runtime (observed against 0.149.1). Rewriting the file wholesale
+   * would drop them, downgrade the workspace to untrusted on the next run and
+   * change command-execution semantics (approval-gated turns whose item
+   * notifications are suppressed) — so codex-managed sections are preserved.
+   */
+  async writeModelConfig() {
+    const configPath = join(this.sessionRoot, 'config.toml')
+    const baseUrl = this.options.baseUrl ?? this.options.provider?.baseUrl
+    const lines = [`model = "${this.options.model}"`]
+    if (baseUrl !== undefined) {
+      lines.push('model_provider = "foreman"', '', '[model_providers.foreman]', 'name = "Foreman"',
+        `base_url = "${baseUrl}"`, 'wire_api = "responses"')
+      // env_key only when a key is actually injected — a dangling env_key makes
+      // codex fail every model request with a missing-variable error
+      if (this.options.apiKey !== undefined) lines.push(`env_key = "${CODEX_API_KEY_ENV}"`)
+    }
+    let content = `${lines.join('\n')}\n`
+    try {
+      const existing = await readFile(configPath, 'utf8')
+      const match = existing.match(/(?<=\n)\[projects[^\]]*\][\s\S]*$/) // codex-written trust entries
+      if (match !== null) content += `\n${match[0].trim()}\n`
+    } catch { /* no config yet */ }
+    await writeFile(configPath, content)
+  }
+
+  /** Load the persisted sessionId -> threadId mapping (restored with the session archive). */
+  async loadThreadIndex() {
+    try {
+      return JSON.parse(await readFile(join(this.sessionRoot, 'threads-index.json'), 'utf8'))
+    } catch { return {} }
+  }
+
+  async saveThreadIndex() {
+    const index = await this.loadThreadIndex()
+    index[this.sessionId] = this.threadId
+    await writeFile(join(this.sessionRoot, 'threads-index.json'), JSON.stringify(index, null, 2))
   }
 
   /**
-   * Launch the codex app-server subprocess and complete the handshake.
-   * handlers: { onEvent(sessionId, event), onStatus(status) }
-   * @returns {Promise<{ threadId: string, ... }>}
+   * Launch the app-server subprocess and complete the handshake + thread setup.
+   * handlers: { onEvent(sessionId, event), onStatus({ sessionId, status }) }
    */
   async start(handlers) {
     const t0 = Date.now()
-    const { binary, args, workspaceDir, modelEnv, envExtra, codexHome } = this.options
     this.handlers = handlers
+    await mkdir(this.sessionRoot, { recursive: true })
+    await this.writeModelConfig()
 
-    this.child = spawn(binary, args, {
-      cwd: workspaceDir,
+    this.child = spawn(this.options.binary, this.options.args, {
+      cwd: this.options.workspaceDir,
       env: {
         ...process.env,
-        ...(envExtra ?? {}),
-        CODEX_HOME: codexHome ?? join(workspaceDir, '.codex'),
-        // API credentials injected via env (never written to disk)
-        ...(modelEnv?.API_KEY !== undefined ? { CODEX_API_KEY: modelEnv.API_KEY } : {}),
-        ...(modelEnv?.BASE_URL !== undefined ? { CODEX_BASE_URL: modelEnv.BASE_URL } : {}),
+        ...(this.options.envExtra ?? {}),
+        CODEX_HOME: this.sessionRoot,
+        ...(this.options.apiKey !== undefined ? { [CODEX_API_KEY_ENV]: this.options.apiKey } : {}),
       },
       stdio: ['pipe', 'pipe', 'pipe'],
     })
-    this.child.stderr.on('data', (chunk) => {
-      this.stderrTail = `${(this.stderrTail ?? '') + chunk.toString('utf8')}`.slice(-4000)
-    })
+    this.child.stderr.setEncoding('utf8')
+    this.child.stderr.on('data', (chunk) => { this.stderrTail = `${this.stderrTail}${chunk}`.slice(-4000) })
     this.child.once('exit', (code) => {
       this.exitCode = code
       this.phase = 'exited'
+      this.turnReject?.(new Error(`codex app-server exited (code=${String(code)}); stderr=${this.stderrTail.slice(-800)}`))
     })
 
-    this.rpc = new CodexJsonRpcClient(this.child.stdout)
-    this.rpc.bindStdin(this.child.stdin)
-
-    // Map Codex notifications to internal frames
-    this.rpc.onNotification((method, params) => {
-      this.onCodexNotification(method, params)
+    this.rpc = new CodexRpcClient(this.child.stdout)
+    this.rpc.stdin = this.child.stdin
+    this.rpc.onNotification((method, params) => this.onNotification(method, params))
+    // Server-initiated requests: approval requests are auto-accepted for now
+    // (full HITL forwarding is a roadmap item); unknown requests are declined.
+    this.rpc.onRequest((message, client) => {
+      if (message.method === 'approval/request') client.respond(message.id, { decision: 'accept' })
+      else client.respond(message.id, { error: { code: -32601, message: `foreman: unhandled server request ${message.method}` } })
     })
 
-    // Initialize handshake: initialize request → initialized notification
     await this.rpc.request('initialize', {
       clientInfo: { name: 'foreman', version: '0.1.0' },
       capabilities: {},
     })
     this.rpc.notify('initialized', {})
 
-    // Create a thread (or resume an existing one)
-    const threadResult = await this.rpc.request('thread/start', {
-      model: this.options.model,
-      cwd: workspaceDir,
-      approvalPolicy: this.options.approvalPolicy,
-    })
-    this.threadId = threadResult.thread?.id ?? threadResult.id
+    // Thread resume (persisted mapping present) or fresh start. sandbox and
+    // approvalPolicy must be re-sent on resume: 0.149.1 otherwise defaults the
+    // resumed thread to a read-only sandbox (verified — thread/resume accepts
+    // both fields per the generated JSON schema).
+    const index = await this.loadThreadIndex()
+    const knownThreadId = index[this.sessionId]
+    if (knownThreadId !== undefined) {
+      try {
+        const result = await this.rpc.request('thread/resume', {
+          threadId: knownThreadId,
+          cwd: this.options.workspaceDir,
+          sandbox: this.options.sandbox,
+          approvalPolicy: this.options.approvalPolicy,
+        })
+        this.threadId = result?.thread?.id ?? knownThreadId
+        this.resumed = true
+      } catch {
+        this.threadId = undefined // stale mapping (thread store not restored): fall through to a fresh thread
+      }
+    }
+    if (this.threadId === undefined) {
+      const result = await this.rpc.request('thread/start', {
+        cwd: this.options.workspaceDir,
+        approvalPolicy: this.options.approvalPolicy,
+        sandbox: this.options.sandbox,
+      })
+      this.threadId = result?.thread?.id
+      if (this.threadId === undefined) throw new Error('codex: thread/start returned no thread id')
+      await this.saveThreadIndex()
+    }
+
     this.phase = 'running'
     this.timings.bootMs = Date.now() - t0
-    return { threadId: this.threadId }
+    return { threadId: this.threadId, resumed: this.resumed === true }
   }
 
-  /**
-   * Map Codex app-server notifications to internal frames.
-   * Codex notification methods and their internal frame equivalents:
-   */
-  onCodexNotification(method, params) {
-    const sessionId = this.threadId ?? 'unknown'
-    const item = params.item ?? params
+  /** Emit an internal frame through the channel's onEvent handler. */
+  emit(type, data) {
+    const event = {
+      kind: 'session.event',
+      sessionId: this.sessionId,
+      seq: ++this.seq,
+      type,
+      time: Date.now(),
+      data,
+    }
+    this.events.push(event)
+    this.handlers.onEvent(this.sessionId, event)
+    return event
+  }
 
+  /** Map verified codex notifications onto internal frames (design doc §4). */
+  onNotification(method, params) {
+    const item = params.item
     switch (method) {
-      // Text delta from an agent message
       case 'item/agentMessage/delta': {
-        if (item.delta?.type === 'text' && typeof item.delta.text === 'string') {
-          const frame = {
-            kind: 'session.event',
-            sessionId,
-            seq: this.events.length + 1,
-            type: 'assistant/chunk',
-            time: Date.now(),
-            data: {
-              turn: this.turnNumber ?? 0,
-              step: this.stepNumber ?? 0,
-              chunk: { type: 'text-delta', index: 0, text: item.delta.text },
-            },
-          }
-          this.events.push(frame)
-          this.handlers.onEvent(sessionId, frame)
+        if (typeof params.delta === 'string' && params.delta.length > 0) {
+          this.emit('assistant/chunk', {
+            turn: this.turnNumber,
+            step: this.stepNumber,
+            chunk: { type: 'text-delta', index: 0, text: params.delta },
+          })
         }
         return
       }
-
-      // Agent message completed (no more deltas)
-      case 'item/agentMessage/complete':
       case 'item/completed': {
-        if (item.type === 'agentMessage') {
-          const texts = []
-          if (item.content && Array.isArray(item.content)) {
-            for (const block of item.content) {
-              if (block.type === 'text') texts.push(block.text)
-            }
-          }
-          if (texts.length > 0) {
-            const frame = {
-              kind: 'session.event',
-              sessionId,
-              seq: this.events.length + 1,
-              type: 'assistant/message',
-              time: Date.now(),
-              data: {
-                turn: this.turnNumber ?? 0,
-                step: this.stepNumber ?? 0,
-                message: { content: item.content ?? [{ type: 'text', text: texts.join('') }] },
-              },
-            }
-            this.events.push(frame)
-            this.handlers.onEvent(sessionId, frame)
-          }
+        if (item?.type === 'agentMessage' && typeof item.text === 'string' && item.text.length > 0) {
+          this.stepNumber += 1
+          this.emit('assistant/message', {
+            turn: this.turnNumber,
+            step: this.stepNumber,
+            message: { content: [{ type: 'text', text: item.text }] },
+          })
+        } else if (item?.type === 'commandExecution') {
+          this.emit('tool/result', { callId: item.id, meta: { diffs: [] } })
         }
         return
       }
-
-      // Tool use started
-      case 'item/toolUse/started': {
-        const frame = {
-          kind: 'session.event',
-          sessionId,
-          seq: this.events.length + 1,
-          type: 'tool/call',
-          time: Date.now(),
-          data: {
-            name: item.name ?? 'unknown',
-            arguments: item.input ?? item.arguments ?? {},
-            callId: item.id ?? `call_${this.events.length}`,
-          },
+      case 'item/started': {
+        if (item?.type === 'commandExecution') {
+          this.emit('tool/call', {
+            name: 'exec_command',
+            arguments: { command: item.command },
+            callId: item.id,
+          })
         }
-        this.events.push(frame)
-        this.handlers.onEvent(sessionId, frame)
         return
       }
-
-      // Tool result started
-      case 'item/toolResult/started': {
-        const frame = {
-          kind: 'session.event',
-          sessionId,
-          seq: this.events.length + 1,
-          type: 'tool/result',
-          time: Date.now(),
-          data: {
-            callId: item.id ?? `call_${this.events.length}`,
-            meta: { diffs: [] },
-          },
-        }
-        this.events.push(frame)
-        this.handlers.onEvent(sessionId, frame)
-        return
-      }
-
-      // Approval requested
-      case 'item/approval/requested': {
-        const frame = {
-          kind: 'approval/requested',
-          sessionId,
-          approvalId: item.id ?? `appr_${this.events.length}`,
-          toolName: item.toolName ?? 'unknown',
-          reason: item.reason ?? {},
-        }
-        this.handlers.onEvent(sessionId, frame)
-        return
-      }
-
-      // Approval resolved
-      case 'item/approval/resolved': {
-        const frame = {
-          kind: 'approval/resolved',
-          sessionId,
-          approvalId: item.id,
-          outcome: item.outcome ?? 'approved',
-        }
-        this.handlers.onEvent(sessionId, frame)
-        return
-      }
-
-      // Turn completed
       case 'turn/completed': {
-        const status = params.turn?.status ?? item.status ?? 'completed'
-        const frame = {
-          kind: 'session.event',
-          sessionId,
-          seq: this.events.length + 1,
-          type: 'turn/end',
-          time: Date.now(),
-          data: {
-            reason: {
-              kind: status === 'completed' ? 'completed' : (status === 'cancelled' ? 'cancelled' : 'error'),
-            },
-          },
-        }
-        this.events.push(frame)
-        this.handlers.onEvent(sessionId, frame)
-        this.turnEndResolve?.(frame)
-        this.turnNumber = (this.turnNumber ?? 0) + 1
-        this.stepNumber = 0
+        const event = this.emit('turn/end', { reason: { kind: turnEndReason(params.turn?.status) } })
+        this.turnEndResolve?.(event)
         return
       }
-
-      // Turn interrupted (timeout or cancellation)
-      case 'turn/interrupted': {
-        const frame = {
-          kind: 'session.event',
-          sessionId,
-          seq: this.events.length + 1,
-          type: 'turn/end',
-          time: Date.now(),
-          data: { reason: { kind: 'cancelled' } },
-        }
-        this.events.push(frame)
-        this.handlers.onEvent(sessionId, frame)
-        this.turnEndResolve?.(frame)
+      case 'thread/status/changed': {
+        const status = params.status?.type
+        if (status !== undefined) this.handlers.onStatus?.({ sessionId: this.sessionId, status })
         return
       }
-
-      // Initialized notification (handshake completion)
-      case 'initialized':
-        // no-op: handshake is complete
-        return
-
       default:
-        // Unknown notification types are silently skipped (resilience to
-        // future Codex app-server protocol additions)
-        return
+        return // configWarning / warning / account/* / remoteControl/* / …: skipped, forward-compatible
     }
   }
 
   /**
    * Send a task and wait for turn/completed.
+   * @returns {Promise<{ reason: { kind: string } }>}
    */
   async prompt(sessionId, text, { timeoutMs = this.options.timeoutMs } = {}) {
     const t0 = Date.now()
-    this.stepNumber = (this.stepNumber ?? 0) + 1
+    this.turnNumber += 1
+    this.stepNumber = 0
 
-    // Wait for turn/completed notification
     const turnEnd = new Promise((resolve, reject) => {
+      this.turnReject = reject
       const timer = setTimeout(() => {
-        reject(new Error(`codex turn/end timeout; stderr=${this.stderrTail ?? ''}`))
+        this.turnEndResolve = undefined
+        this.turnReject = undefined
+        // Best-effort interrupt, then surface the timeout.
+        this.rpc.request('turn/interrupt', {}).catch(() => {})
+        reject(new Error(`codex turn timeout after ${String(timeoutMs)}ms; stderr=${this.stderrTail.slice(-800)}`))
       }, timeoutMs)
-      this.turnEndResolve = (frame) => {
+      this.turnEndResolve = (event) => {
         clearTimeout(timer)
         this.turnEndResolve = undefined
-        resolve(frame)
+        this.turnReject = undefined
+        resolve(event)
       }
     })
 
-    try {
-      await this.rpc.request('turn/start', {
-        threadId: this.threadId,
-        input: [{ type: 'text', text }],
-        cwd: this.options.workspaceDir,
-      })
-    } catch (error) {
-      // First-turn race fallback: retry if thread is not ready
-      if (String(error).includes('thread-not-found') || String(error).includes('not found')) {
-        // Re-create the thread and retry
-        const threadResult = await this.rpc.request('thread/start', {
-          model: this.options.model,
-          cwd: this.options.workspaceDir,
-          approvalPolicy: this.options.approvalPolicy,
-        })
-        this.threadId = threadResult.thread?.id ?? threadResult.id
-        // Re-create the prompt
-        await this.rpc.request('turn/start', {
-          threadId: this.threadId,
-          input: [{ type: 'text', text }],
-          cwd: this.options.workspaceDir,
-        })
-      } else {
-        throw error
-      }
-    }
+    await this.rpc.request('turn/start', {
+      threadId: this.threadId,
+      input: [{ type: 'text', text }],
+    })
 
     const end = await turnEnd
     this.timings.turnMs = Date.now() - t0
     return { reason: end.data.reason }
   }
 
-  /**
-   * Graceful shutdown: close stdin (triggers app-server exit), wait for exit.
-   */
+  /** Graceful shutdown: close stdin, escalate to SIGTERM/SIGKILL on timeout. */
   async shutdown() {
     if (this.child === undefined) return 0
-    // Close stdin to signal graceful shutdown to the app-server
+    const exit = new Promise((resolve) => { this.child.once('exit', (code) => resolve(code ?? 0)) })
     this.child.stdin.end()
-    const exitCodePromise = new Promise((resolve) => { this.child.once('exit', (code) => resolve(code ?? 0)) })
-    const timeout = (ms) => new Promise((resolve) => { setTimeout(() => { resolve('timeout') }, ms) })
-    let code = await Promise.race([exitCodePromise, timeout(15_000)])
+    const wait = (ms) => new Promise((resolve) => { setTimeout(() => resolve('timeout'), ms) })
+    let code = await Promise.race([exit, wait(15_000)])
     if (code === 'timeout') {
       this.child.kill('SIGTERM')
-      code = await Promise.race([exitCodePromise, timeout(10_000)])
+      code = await Promise.race([exit, wait(10_000)])
     }
     if (code === 'timeout') {
       this.child.kill('SIGKILL')
-      code = await exitCodePromise
+      code = await exit
     }
     this.phase = 'stopped'
     return code
   }
 
-  /**
-   * Hard kill (simulating a sandbox crash/reclaim): no cleanup.
-   */
+  /** Hard kill (crash/reclaim simulation): immediate SIGKILL, no cleanup. */
   kill() {
     if (this.child === undefined) return Promise.resolve(0)
-    this.child.kill('SIGKILL')
     this.phase = 'killed'
+    this.child.kill('SIGKILL')
     return new Promise((resolve) => { this.child.once('exit', (code) => resolve(code ?? 0)) })
   }
 }
