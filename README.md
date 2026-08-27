@@ -52,6 +52,13 @@ code changes.
 - **Dual trace paths** — path A: harness's native OTLP telemetry exported to cloud monitoring;
   path B: foreman's own event-stream forwarding (redacted). An optional async trace shipper
   isolates cloud-monitoring failures with retry and eventual delivery.
+- **Run profiling & throughput model (ADR-0013)** — every run is instrumented by an
+  always-on span profiler (`profile.json` artifact + a `profiling` section in
+  `result.json`): time decomposition `T_run = P + B + Σ(Eᵢ + commitᵢ) + C + U + O`,
+  derived scheduling quantities (`usefulWorkRatio`, `turnThroughputPerSec`,
+  `warmupMs`, `saveCostMs`), and per-turn records. The model, the measurement
+  and the current best strategy are written down in
+  [docs/design/performance-modeling.md](docs/design/performance-modeling.md).
 - **Storage abstraction** — a snapshot sink interface (local / object-store) resolves
   credentials dynamically from env on each call, so token rotation never requires a restart.
 
@@ -96,10 +103,15 @@ solution/
         anthropic-messages.js Anthropic Messages API events (alias: claude)
       event-bus.js        event bus delivery (memory / http)
     observability/
+      profiler.js          run profiler: spans/counters/turn records + derived metrics (ADR-0013)
       trace-shipper.js    async trace shipping with retry + failure isolation
     storage/
       snapshot-sink.js    snapshot storage abstraction (credentials via env)
     config.js             runner config file loader (protocol / delivery selection)
+  examples/
+    dsh-real.js           full lifecycle vs the real DeepSeek API (dsh-sdk channel)
+    codex-real.js         full lifecycle vs the real DeepSeek API (codex channel, Responses wire)
+    README.md             what the examples show, prerequisites, expected output
   plugins/
     resume-adapter.mjs    reroutes persisted sessionIds from agents.create to agents.resume
     telemetry-enrich.mjs  deployment-side telemetry attribute pipeline (rule table)
@@ -123,7 +135,17 @@ solution/
 
 ## Quick start
 
-Requirements: Node.js >= 22.19, a built harness repository, and the `git` binary in PATH.
+Requirements: Node.js >= 22.19, the `git` binary in PATH, and the harness
+distributions on PATH (installed from npm — **not** from source checkouts; ADR-0012.
+Install them one at a time; use a China mirror if an install stalls):
+
+```sh
+npm install -g @deepseek-ai/dsh-sdk-jsonrpc-demo   # provides dsh-jsonrpc-agent
+npm install -g @openai/codex                        # provides codex
+```
+
+A missing binary is a hard failure everywhere (tests, benchmarks, examples) —
+there are no silent skips.
 
 ```sh
 # from foreman/solution
@@ -138,12 +160,19 @@ pnpm test:e2e:checkpoint  # 7-round incremental checkpoint chain + retention + r
 pnpm test:e2e:codex       # cold start + cross-sandbox resume (codex channel)
 pnpm test:e2e:checkpoint:codex  # checkpoint chain stress on the codex channel (retention/rebase/restore)
 pnpm test:e2e:config      # config-only channel switching acceptance (codex full run + dsh resolution)
+
+# real-API examples (no scripted model — the live DeepSeek API drives the turns)
+DEEPSEEK_API_KEY=sk-... node examples/dsh-real.js
+DEEPSEEK_API_KEY=sk-... node examples/codex-real.js
 ```
 
 All tests are keyless: they run against in-process mocks of the model endpoint, the control
-plane, and the OTLP collector. The dsh e2e scenarios additionally require the harness
-repository checkout one level above this one; the codex e2e only needs the `codex` binary
-(codex-cli) in PATH and is otherwise self-contained.
+plane, and the OTLP collector, while every harness/git/tar/HTTP upload path is real
+(ADR-0004 hermetic strategy). The codex e2e needs the `codex` binary in PATH; the dsh
+scenarios need the `dsh-jsonrpc-agent` distribution binary. The real-model path is
+exercised by the [real-API examples](examples/README.md) — the only network egress there
+is the model API call itself, and the API key is asserted absent from every uploaded
+artifact.
 
 ### Protocol selection via config file
 
@@ -209,7 +238,7 @@ await foreman.start()                // launch harness + open the SSE gateway
 const { reason } = await foreman.prompt('do the task')
 await foreman.shutdown()             // graceful (or foreman.kill() to simulate a crash)
 await foreman.collect()              // final answer, change sets, session logs
-await foreman.publish()              // redact + package + upload + reclaim event
+await foreman.publish()              // redact + package + upload + reclaim event (the terminal save-and-handoff: after publish, killing the sandbox loses nothing)
 ```
 
 ## Protocol adapters
@@ -236,6 +265,12 @@ a matter of writing a single module.
   (ADR-0005), JSON-RPC lifecycle, frame mapping.
 - [Anthropic Messages design](docs/design/anthropic-messages-protocol.md) — Claude Code
   protocol adapter (ADR-0006), event mapping, content block model.
+- [Performance modeling](docs/design/performance-modeling.md) — the run cost model
+  (`T_run = P + B + Σ(Eᵢ + commitᵢ) + C + U + O`), the profiling mechanism that
+  measures it (ADR-0013), and the current best strategy (incl. what `publish`
+  is and why it exists).
+- [Real-API examples](examples/README.md) — full lifecycle runs of both channels
+  against the live DeepSeek API.
 - Architecture Decision Records ([docs/adr/](docs/adr/)):
   - [ADR-0001](docs/adr/0001-generic-sse-protocol-adapter-layer.md) — generic SSE protocol
     adapter layer.
@@ -259,6 +294,10 @@ a matter of writing a single module.
     I/O, with the critical-path model and measured verification.
   - [ADR-0011](docs/adr/0011-session-boundary-overlap-scheduling.md) — session-boundary
     overlap scheduling (simplification; supersedes ADR-0010's per-turn background sync).
+  - [ADR-0012](docs/adr/0012-dsh-distribution-launch.md) — launching dsh from its npm
+    distribution (no source-checkout dependency).
+  - [ADR-0013](docs/adr/0013-run-profiling-and-throughput-model.md) — run profiling and
+    the task-throughput performance model.
 
 ## License
 

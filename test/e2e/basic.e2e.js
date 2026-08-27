@@ -21,10 +21,9 @@
  *
  * Usage: node test/e2e/basic.e2e.js [--keep] (any cwd; --keep preserves the
  * run directory). Requires the dsh npm distribution on PATH (ADR-0012; see
- * README "Prerequisites"); skips when the binary is absent.
+ * README "Prerequisites"); a missing binary fails loud.
  */
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
-import { execFile } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Foreman } from '../../src/foreman.js'
@@ -33,18 +32,13 @@ import { uploadArtifact, downloadArtifact } from '../../src/control-plane.js'
 import { startMockControlPlane } from '../mocks/control-plane.js'
 import { startMockModel } from '../mocks/model.js'
 import { startMockOtlpCollector } from '../mocks/otlp.js'
+import { requireBinary } from '../require-bin.js'
 
 const repoDir = new URL('../../', import.meta.url).pathname // foreman repository root
 const keep = process.argv.includes('--keep')
 
-// Skip when the dsh distribution binary is unavailable (ADR-0012)
-const dshAvailable = await new Promise((resolve) => {
-  execFile('dsh-jsonrpc-agent', [], (error) => { resolve(error?.code !== 'ENOENT') })
-})
-if (!dshAvailable) {
-  console.log('SKIP: dsh-jsonrpc-agent not found on PATH (install: npm install -g @deepseek-ai/dsh-sdk-jsonrpc-demo — see README Prerequisites)')
-  process.exit(0)
-}
+// The dsh distribution binary is a hard prerequisite (ADR-0012) — never a skip
+await requireBinary('dsh-jsonrpc-agent', [], 'npm install -g @deepseek-ai/dsh-sdk-jsonrpc-demo (see README Prerequisites)')
 
 const t0 = Date.now()
 const log = (...args) => { console.log(`[+${((Date.now() - t0) / 1000).toFixed(1)}s]`, ...args) }
@@ -218,6 +212,24 @@ assert('R1 packaging masks content (README.md and report.md -> [REDACTED])',
   published1.masked.includes('report.md') && published1.masked.includes('README.md'),
   JSON.stringify(published1.masked))
 
+// Profiling (ADR-0013): the run self-reports its cost structure — the
+// profile.json artifact carries spans + the derived throughput view, and
+// result.json embeds the derived summary
+const profileBuffer = await downloadArtifact(controlPlane, agentId, `${sessionId}/profile.json`)
+const profile = JSON.parse(profileBuffer.toString('utf8'))
+assert('R1 profile.json uploaded (schema 1, spans + counters + derived)',
+  profile.schema === 1 && profile.spans.length > 0 && profile.counters !== undefined)
+const pd = profile.derived
+assert('R1 profile derived metrics complete (model terms: P, B, ΣE, U, ratio)',
+  pd.prepareMs > 0 && pd.bootMs > 0 && pd.executionMs > 0 && pd.publishMs > 0
+    && pd.runWallMs > 0 && pd.usefulWorkRatio > 0 && pd.usefulWorkRatio < 1
+    && pd.turns === 1 && pd.turnThroughputPerSec > 0,
+  JSON.stringify(pd))
+assert('R1 profile spans cover the lifecycle families (prepare/start/turn/collect/publish)',
+  ['prepare', 'start.channel', 'turn.1.execute', 'collect', 'publish'].every((prefix) =>
+    profile.spans.some((span) => span.name === prefix || span.name.startsWith(`${prefix}.`))))
+assert('R1 profile counts stream events by type', Object.keys(profile.counters).some((key) => key.startsWith('event.')))
+
 // Fetch the uploaded workspace archive from object storage and verify redaction
 const verifyDir = join(base, 'verify-run1')
 await extractArchive(join(sandboxDir, 'artifacts', 'workspace.tar.gz'), verifyDir)
@@ -243,7 +255,9 @@ const busTypes = controlPlane.events.map((event) => event.type)
 assert('R1 bus event: run.completed', busTypes.includes('run.completed'))
 assert('R1 bus event: sandbox.reclaim-requested (triggers sandbox reclaim)', busTypes.includes('sandbox.reclaim-requested'))
 const reclaim = controlPlane.events.find((event) => event.type === 'sandbox.reclaim-requested')
-assert('R1 reclaim event carries the full artifact list', reclaim !== undefined && reclaim.artifacts.length === 4,
+assert('R1 reclaim event carries the full artifact list (incl. the profile — ADR-0013)',
+  reclaim !== undefined && reclaim.artifacts.length === 5
+    && reclaim.artifacts.includes('sess-e2e-basic-001/profile.json'),
   JSON.stringify(reclaim?.artifacts))
 sse.abort()
 

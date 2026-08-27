@@ -30,11 +30,10 @@
  *
  * Usage: node test/e2e/web.e2e.js [--keep] (any cwd; --keep preserves the run
  * directory). Requires the dsh npm distribution on PATH (ADR-0012; see README
- * "Prerequisites"); skips when the binary is absent.
+ * "Prerequisites"); a missing binary fails loud.
  */
 import { createHash } from 'node:crypto'
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
-import { execFile } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Foreman } from '../../src/foreman.js'
@@ -43,18 +42,13 @@ import { downloadArtifact, uploadArtifact } from '../../src/control-plane.js'
 import { startMockControlPlane } from '../mocks/control-plane.js'
 import { startMockModel } from '../mocks/model.js'
 import { startMockOtlpCollector } from '../mocks/otlp.js'
+import { requireBinary } from '../require-bin.js'
 
 const repoDir = new URL('../../', import.meta.url).pathname
 const keep = process.argv.includes('--keep')
 
-// Skip when the dsh distribution binary is unavailable (ADR-0012)
-const dshAvailable = await new Promise((resolve) => {
-  execFile('dsh', ['--version'], (error) => { resolve(error?.code !== 'ENOENT') })
-})
-if (!dshAvailable) {
-  console.log('SKIP: dsh not found on PATH (install: npm install -g @deepseek-ai/dsh — see README Prerequisites)')
-  process.exit(0)
-}
+// The dsh distribution binary is a hard prerequisite (ADR-0012) — never a skip
+await requireBinary('dsh', ['--version'], 'npm install -g @deepseek-ai/dsh (see README Prerequisites)')
 
 const t0 = Date.now()
 const log = (...args) => { console.log(`[+${((Date.now() - t0) / 1000).toFixed(1)}s]`, ...args) }

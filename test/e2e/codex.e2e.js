@@ -15,13 +15,12 @@
  *
  * The model endpoint is a local scripted Responses-API fixture: the network,
  * codex binary, git, tar and HTTP uploads are all real; only the model is
- * scripted (ADR-0004). Requires the `codex` binary on PATH; skips (exit 0)
- * when absent.
+ * scripted (ADR-0004). Requires the `codex` binary on PATH; a missing binary
+ * fails loud.
  *
  * Usage: node test/e2e/codex.e2e.js [--keep]
  */
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
-import { execFile } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Foreman } from '../../src/foreman.js'
@@ -29,6 +28,7 @@ import { downloadArtifact, uploadArtifact } from '../../src/control-plane.js'
 import { startMockControlPlane } from '../mocks/control-plane.js'
 import { startCodexResponsesFixture } from '../fixtures/codex-responses.js'
 import { archiveDirectory } from '../../src/core/workspace.js'
+import { requireBinary } from '../require-bin.js'
 
 const keep = process.argv.includes('--keep')
 const t0 = Date.now()
@@ -43,14 +43,8 @@ function assert(name, condition, detail = '') {
 
 const fileExists = async (path) => { try { await access(path); return true } catch { return false } }
 
-// ---- Skip when the codex binary is unavailable ----
-const codexAvailable = await new Promise((resolve) => {
-  execFile('codex', ['--version'], (error) => { resolve(error === null) })
-})
-if (!codexAvailable) {
-  console.log('SKIP: codex binary not found on PATH (install: npm install -g @openai/codex)')
-  process.exit(0)
-}
+// The codex binary is a hard prerequisite — never a skip
+await requireBinary('codex', ['--version'], 'npm install -g @openai/codex')
 
 const agentId = 'agent-codex'
 const sessionId = 'sess-e2e-codex-001'

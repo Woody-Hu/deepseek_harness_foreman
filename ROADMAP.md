@@ -95,6 +95,29 @@ Canonical ids per ADR-0009 (legacy aliases `stdio` / `web` accepted):
   retried, queue overflow drops oldest).
 - Snapshot sink abstraction (local / object-store), credentials resolved from env per call.
 
+### Profiling & performance modeling (ADR-0013)
+
+- **RunProfiler** (`src/observability/profiler.js`) — always-on span recorder:
+  hierarchical spans for every lifecycle sub-phase, stream counters, per-turn
+  records (execute/commit/first-event latency). Additive to the flat `timings`
+  compatibility map.
+- **Emission** — `profile.json` joins the artifact batch (full spans + counters
+  + derived metrics); `result.json` gains a `profiling` summary section.
+- **Throughput model** — `T_run = P + B + Σ(Eᵢ + commitᵢ) + C + U + O` with
+  derived scheduling quantities (`usefulWorkRatio`, `turnThroughputPerSec`,
+  `warmupMs`, `saveCostMs`, `eventRatePerSec`); the model, its measurement and
+  the current best strategy are written down in
+  [docs/design/performance-modeling.md](docs/design/performance-modeling.md).
+
+### Real-API examples
+
+- `examples/dsh-real.js` / `examples/codex-real.js` — full lifecycle runs of both
+  channels against the **real DeepSeek API** (no scripted model): dsh via
+  chat-completions (`deepseek-v4-pro`), codex via DeepSeek's Responses-wire
+  endpoint (`wire_api = "responses"`; codex 0.150 removed `"chat"`). The control
+  plane stays local (all artifacts remain on the machine); the API key is
+  env-injected only and asserted absent from every uploaded artifact.
+
 ### Testing & benchmarking (ADR-0004, hermetic — no mocks in the measured path)
 
 - **Golden-transcript conformance tests** (`test/protocols.test.js`) — every adapter must
@@ -105,12 +128,16 @@ Canonical ids per ADR-0009 (legacy aliases `stdio` / `web` accepted):
 - **E2E scenarios** — basic resume, web HITL + crash recovery, cloud (trace/sink/bus/
   adaptation), 7-round checkpoint chain, codex channel (cold start + cross-sandbox
   `thread/resume` + tool execution + checkpoint restore, driven by the real codex binary
-  against a scripted Responses-API endpoint; skips when the binary is absent),
-  config-only channel selection (codex full run + dsh-sdk/dsh-web resolution, entirely
-  from `foreman.config.json`), checkpoint-chain stress on the codex channel (retention
-  drops / anchor-drift rebuilds / rebase / bit-for-bit restore under the concurrent
-  publish fan-out). The dsh scenarios additionally require the harness repository
-  checkout one level above this one.
+  against a scripted Responses-API endpoint), config-only channel selection (codex full
+  run + dsh-sdk/dsh-web resolution, entirely from `foreman.config.json`),
+  checkpoint-chain stress on the codex channel (retention drops / anchor-drift
+  rebuilds / rebase / bit-for-bit restore under the concurrent publish fan-out).
+  Harness binaries are **hard prerequisites** (`test/require-bin.js`): a missing
+  `dsh-jsonrpc-agent` / `codex` binary fails loud with install instructions —
+  never a silent skip. The dsh scenarios require only the npm distribution on
+  PATH (ADR-0012), not a source checkout; the scripted model/OTLP/control-plane
+  remain in-process for keyless hermetic runs, while the real-model path is
+  exercised by the [real-API examples](#real-api-examples).
 - **Protocol pipeline benchmark** (`npm run bench`) — formatter-only throughput plus
   end-to-end throughput/latency (p50/p95/p99) per protocol over real loopback HTTP, driven
   by the same golden transcripts; results written to `bench/results/`. Integrity gate: the
@@ -134,10 +161,12 @@ Reference figures (this sandbox, `--quick`, median of 3 runs — indicative, not
 
 ### Documentation
 
-- ADRs 0001–0011 (adapter layer, config file, codex dialect, hermetic testing, Codex channel,
+- ADRs 0001–0013 (adapter layer, config file, codex dialect, hermetic testing, Codex channel,
   Anthropic Messages, inbound adaptation, harness protocol testing, channel naming, overlap
-  scheduling, session-boundary overlap).
-- Design docs: SSE protocol adapter, Codex channel, Anthropic Messages protocol.
+  scheduling, session-boundary overlap, dsh distribution launch, run profiling and the
+  throughput model).
+- Design docs: SSE protocol adapter, Codex channel, Anthropic Messages protocol,
+  performance modeling (the throughput model + current best strategy).
 - Architecture + checkpoint design docs; this roadmap.
 
 ---
@@ -171,6 +200,11 @@ Deliberate limits of the current implementation; each maps to a roadmap item bel
    network (behind the platform's ingress); no per-subscriber tokens.
 9. **No Claude Code Remote (WebSocket) protocol support.** The reverse-engineered
    dual-channel protocol (WebSocket streaming + HTTP REST) is not covered.
+10. **Profiling is produced, not yet consumed.** Every run emits `profile.json`
+    with the throughput view (ADR-0013), but no scheduler yet reads it —
+    reclaim/keep-warm/batching decisions are still policy-free. The model's
+    constants are single-run; fleet-level aggregation is a control-plane
+    concern.
 
 ---
 
@@ -221,6 +255,21 @@ Deliberate limits of the current implementation; each maps to a roadmap item bel
       (`src/events/protocols/anthropic-messages.js`).
 - [x] **SSE `event:` line support** — `renderSseLine` extended with optional named events
       for the Anthropic SSE protocol format.
+- [x] **Run profiling + throughput performance model** (ADR-0013) — always-on
+      `RunProfiler` (spans/counters/turn records) instrumenting the full
+      lifecycle; `profile.json` artifact + `result.json.profiling`; derived
+      scheduling quantities (`usefulWorkRatio`, `turnThroughputPerSec`,
+      `warmupMs`, `saveCostMs`); the written-down model in
+      `docs/design/performance-modeling.md` (incl. what `publish` is and the
+      current best strategy). Unit + e2e coverage of the profile schema.
+- [x] **Real-API examples** — `examples/dsh-real.js` (dsh-sdk channel,
+      chat-completions wire) and `examples/codex-real.js` (codex channel,
+      DeepSeek's Responses wire): full lifecycle against the live DeepSeek API,
+      secret-hygiene assertion on every uploaded artifact.
+- [x] **Fail-loud binary gates** — `test/require-bin.js` replaces every
+      "SKIP: binary not found" path (tests and benchmarks): a missing harness
+      distribution fails with install instructions instead of silently
+      passing.
 
 ### Next up (short term)
 
@@ -231,6 +280,10 @@ Deliberate limits of the current implementation; each maps to a roadmap item bel
       `POST /hitl` decisions (approval policy is currently set to a fixed value per run).
 - [ ] **Gateway authentication** — per-subscriber token/auth on `GET /events` and
       `POST /hitl`, credentials injected via env like all other secrets.
+- [ ] **Scheduler policies driven by profiles** — reclaim/keep-warm decisions
+      and turn-batching heuristics consuming `profile.json`'s derived metrics
+      (`warmupMs` vs. expected idle time; `saveCostMs` vs. per-turn commit),
+      plus fleet-level aggregation at the control plane.
 
 ### Later (medium term)
 

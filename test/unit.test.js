@@ -14,6 +14,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createEventFormatter, renderSseLine } from '../src/events/formats.js'
 import { TraceShipper } from '../src/observability/trace-shipper.js'
+import { RunProfiler } from '../src/observability/profiler.js'
 import { createSnapshotSink } from '../src/storage/snapshot-sink.js'
 import { createEventBus } from '../src/events/event-bus.js'
 import { GitWorkspace } from '../src/core/git-workspace.js'
@@ -496,4 +497,86 @@ test('checkpoint: secret interception is inherited along the chain — intercept
   await git2.ensureRepo()
   await applyChangePack(git2, packDir, 'foreman: checkpoint 1 (replayed)')
   assert.ok(!(await git2.lsTree('HEAD')).includes('leak.txt'))
+})
+
+test('profiler: spans, counters, gauges; error paths still record the span', async () => {
+  const profiler = new RunProfiler({ channel: 'codex', sessionId: 's1', agentId: 'a1' })
+  const value = await profiler.span('prepare.config.download', async () => {
+    await new Promise((resolve) => { setTimeout(resolve, 5) })
+    return 42
+  })
+  assert.equal(value, 42) // the span wrapper is transparent
+  assert.equal(profiler.span('publish.packaging.trace', () => 'ok'), 'ok') // sync spans work too
+  await assert.rejects(profiler.span('turn.1.execute', async () => { throw new Error('boom') }), /boom/)
+  const span = profiler.spans.find((entry) => entry.name === 'turn.1.execute')
+  assert.ok(span !== undefined && span.durationMs >= 0) // the failed span is still recorded
+  assert.ok(profiler.spans.find((entry) => entry.name === 'prepare.config.download').durationMs >= 5)
+})
+
+test('profiler: derived metrics match the performance model (P + B + ΣE + C + U decomposition)', async () => {
+  const profiler = new RunProfiler({ sessionId: 's1' })
+  await profiler.span('prepare.workspace.download', () => new Promise((resolve) => { setTimeout(resolve, 10) }))
+  await profiler.span('start.channel', () => new Promise((resolve) => { setTimeout(resolve, 10) }))
+  const turn = profiler.beginTurn(1)
+  await profiler.span('turn.1.execute', () => new Promise((resolve) => { setTimeout(resolve, 20) }))
+  profiler.noteEvent('assistant/chunk')
+  profiler.noteEvent('assistant/chunk')
+  profiler.noteEvent('tool/call')
+  profiler.endTurn(turn, { executeMs: 20, commitMs: 4 })
+  await profiler.span('turn.1.commit', () => new Promise((resolve) => { setTimeout(resolve, 4) }))
+  await profiler.span('collect', () => new Promise((resolve) => { setTimeout(resolve, 3) }))
+  await profiler.span('publish.packaging.workspace', () => new Promise((resolve) => { setTimeout(resolve, 7) }))
+  profiler.count('upload')
+  profiler.gauge('checkpoint.packs', 2)
+  profiler.end()
+
+  const derived = profiler.derived()
+  const approx = (actual, expected, slack = 2) =>
+    assert.ok(Math.abs(actual - expected) <= slack, `${actual} ≉ ${expected}±${slack}`)
+  assert.equal(derived.turns, 1)
+  assert.equal(derived.events, 3) // event.* counters only
+  assert.equal(derived.executionMs, 20)
+  assert.equal(derived.commitMs, 4)
+  approx(derived.prepareMs, 10)
+  approx(derived.bootMs, 10)
+  approx(derived.collectMs, 3)
+  approx(derived.publishMs, 7)
+  approx(derived.warmupMs, 20) // P + B
+  approx(derived.saveCostMs, 7) // U
+  assert.ok(derived.runWallMs >= 54) // at least the sum of the (serial) spans
+  assert.ok(derived.usefulWorkRatio > 0 && derived.usefulWorkRatio < 1)
+  assert.ok(derived.turnThroughputPerSec > 0)
+  assert.ok(derived.eventRatePerSec > 0)
+  assert.equal(derived.turnDetails[0].firstEventLatencyMs >= 20, true) // first event after the execute span
+  assert.equal(derived.turnDetails[0].events, 3)
+
+  const report = profiler.report()
+  assert.equal(report.schema, 1)
+  assert.equal(report.counters['event.assistant/chunk'], 2)
+  assert.equal(report.counters['upload'], 1)
+  assert.equal(report.gauges['checkpoint.packs'], 2)
+  assert.ok(report.spans.length >= 5)
+  assert.equal(report.endedAt <= new Date().toISOString(), true)
+})
+
+test('profiler: spanFrom records externally measured boundaries', () => {
+  const profiler = new RunProfiler({ sessionId: 's1' })
+  profiler.spanFrom('publish.uploads', 100, 250)
+  assert.equal(profiler.derived().publishMs, 150)
+  assert.equal(profiler.derived().saveCostMs, 150)
+})
+
+// The derived publish decomposition: max(K, ΣC) + Ubatch is the ADR-0011
+// critical path; the profiler's span sums are the raw material for it.
+test('profiler: publish spans support the ADR-0011 critical-path computation', async () => {
+  const profiler = new RunProfiler({ sessionId: 's1' })
+  await profiler.span('publish.packaging.workspace', () => new Promise((resolve) => { setTimeout(resolve, 30) })) // K
+  await profiler.span('publish.checkpointSync', () => new Promise((resolve) => { setTimeout(resolve, 20) })) // ΣC
+  await profiler.span('publish.uploads', () => new Promise((resolve) => { setTimeout(resolve, 10) })) // Ubatch
+  const derived = profiler.derived()
+  const K = 30, sumC = 20, Ubatch = 10
+  assert.ok(Math.abs(derived.publishMs - (K + sumC + Ubatch)) <= 2) // serialized wall time
+  const projectedSerial = K + sumC + Ubatch
+  const projectedOverlap = Math.max(K, sumC) + Ubatch
+  assert.ok(projectedOverlap < projectedSerial) // the model predicts the saving
 })
