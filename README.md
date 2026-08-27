@@ -238,7 +238,7 @@ await foreman.start()                // launch harness + open the SSE gateway
 const { reason } = await foreman.prompt('do the task')
 await foreman.shutdown()             // graceful (or foreman.kill() to simulate a crash)
 await foreman.collect()              // final answer, change sets, session logs
-await foreman.publish()              // redact + package + upload + reclaim event
+await foreman.publish()              // redact + package + upload + reclaim event (the terminal save-and-handoff: after publish, killing the sandbox loses nothing)
 ```
 
 ## Protocol adapters
