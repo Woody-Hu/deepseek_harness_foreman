@@ -2,9 +2,11 @@
 
 Two runnable examples drive the full foreman lifecycle (`prepare → start →
 prompt → collect → publish → shutdown`) against the **real DeepSeek API** —
-no scripted model, no mocks on the model path. The only thing that stays local
-is the control plane (object storage + message bus on 127.0.0.1): every
-artifact stays on this machine, the only network egress is the model API call.
+no scripted model, no mocks. The control plane (object storage + message bus)
+runs in **local mode**: a real server on 127.0.0.1
+(`local-control-plane.js`) implementing the same wire contract as the cloud
+side, with every artifact and bus event persisted to disk. Every artifact
+stays on this machine; the only network egress is the model API call.
 
 | Example | Channel | Harness binary | Model endpoint |
 | --- | --- | --- | --- |
@@ -32,7 +34,8 @@ DEEPSEEK_API_KEY=sk-... node examples/codex-real.js
 ```
 
 Both examples `--keep` the run directory when passed the flag (inspect
-`workspace/`, `artifacts/`, and the seeded object storage afterwards).
+`workspace/`, `artifacts/`, and the local control plane's `storage/` +
+`bus-events.jsonl` afterwards).
 
 ## What each example shows
 

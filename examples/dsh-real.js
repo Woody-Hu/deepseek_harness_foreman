@@ -1,14 +1,15 @@
 /**
  * Example: dsh harness (SDK stdio channel) driven end to end against the REAL
- * DeepSeek API — no scripted model, no mocks on the model path.
+ * DeepSeek API — no scripted model, no mocks.
  *
  * What is real here:
  *   - dsh-jsonrpc-agent: the npm distribution binary (ADR-0012), not a source checkout
  *   - the model: https://api.deepseek.com (deepseek-v4-pro, real tool-calling turns)
  *   - git, tar packaging, SSE gateway, checkpoint pack build/upload
  *
- * What is a local stand-in: the control plane (object storage + message bus)
- * runs on 127.0.0.1 — every artifact stays on this machine. The only network
+ * Local mode: the control plane (object storage + message bus) runs as a real
+ * local server on 127.0.0.1 (examples/local-control-plane.js) — every artifact
+ * and bus event is persisted to disk, nothing is mocked. The only network
  * egress is the model API call itself. The API key is injected via env only
  * (never written to disk) and is additionally registered as a secret value so
  * any accidental occurrence in artifacts is masked.
@@ -23,7 +24,7 @@ import { join } from 'node:path'
 import { Foreman } from '../src/foreman.js'
 import { archiveDirectory } from '../src/core/workspace.js'
 import { downloadArtifact, uploadArtifact } from '../src/control-plane.js'
-import { startMockControlPlane } from '../test/mocks/control-plane.js'
+import { startLocalControlPlane } from './local-control-plane.js'
 import { requireBinary } from '../test/require-bin.js'
 
 const repoDir = new URL('../', import.meta.url).pathname
@@ -46,8 +47,9 @@ const sessionId = `sess-example-dsh-${Date.now()}`
 const base = await mkdtemp(join(tmpdir(), 'foreman-example-dsh-'))
 const sandboxDir = join(base, 'sandbox')
 
-// Local stand-in for the cloud control plane (object storage + bus, 127.0.0.1)
-const controlPlane = await startMockControlPlane({ dir: join(base, 'control-plane') })
+// Local mode: a real control-plane server on 127.0.0.1, backed by disk
+// (storage/ + bus-events.jsonl under the run's control-plane/ directory)
+const controlPlane = await startLocalControlPlane({ dir: join(base, 'control-plane') })
 log('local control plane port:', controlPlane.port)
 
 // ---- Seed object storage: composition config + workspace (as the cloud would) ----
