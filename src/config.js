@@ -14,9 +14,10 @@
  *       "model":    <string>,                          // chunk/response model field
  *       "bus":      <createEventBus configuration>
  *     },
- *     "harness": {                                      // ADR-0005 / ADR-0009
+ *     "harness": {                                      // ADR-0005 / ADR-0009 / ADR-0012
  *       "channel": "dsh-sdk" | "dsh-web" | "codex" (+ legacy aliases),
- *       "codex": { binary, args, model, provider, approvalPolicy, sandbox, timeoutMs }
+ *       "codex": { binary, args, model, provider, approvalPolicy, sandbox, timeoutMs },
+ *       "dsh": { command, jsonrpcCommand }
  *     }
  *   }
  */
@@ -24,9 +25,10 @@ import { readFile } from 'node:fs/promises'
 
 const KNOWN_TOP_KEYS = new Set(['events', 'harness'])
 const KNOWN_EVENTS_KEYS = new Set(['protocol', 'delivery', 'model', 'bus'])
-const KNOWN_HARNESS_KEYS = new Set(['channel', 'codex'])
+const KNOWN_HARNESS_KEYS = new Set(['channel', 'codex', 'dsh'])
 const KNOWN_CODEX_KEYS = new Set(['binary', 'args', 'model', 'provider', 'approvalPolicy', 'sandbox', 'timeoutMs'])
 const KNOWN_PROVIDER_KEYS = new Set(['name', 'baseUrl', 'envKey'])
+const KNOWN_DSH_KEYS = new Set(['command', 'jsonrpcCommand'])
 const CODEX_SANDBOX_MODES = new Set(['read-only', 'workspace-write', 'danger-full-access'])
 
 /** Canonical channel ids (ADR-0009). */
@@ -127,6 +129,22 @@ function validateHarness(harness, path) {
     resolveChannelId(harness.channel) // throws with the accepted values on typos
   }
   if (harness.codex !== undefined) validateCodex(harness.codex, path)
+  if (harness.dsh !== undefined) validateDsh(harness.dsh, path)
+}
+
+function validateDsh(dsh, path) {
+  if (dsh === null || typeof dsh !== 'object' || Array.isArray(dsh)) {
+    throw new Error(`foreman-config: harness.dsh in '${path}' must be an object`)
+  }
+  const unknown = Object.keys(dsh).filter((key) => !KNOWN_DSH_KEYS.has(key))
+  if (unknown.length > 0) {
+    throw new Error(`foreman-config: unknown key(s) under 'harness.dsh' in '${path}': ${unknown.join(', ')} (known: ${[...KNOWN_DSH_KEYS].join(', ')})`)
+  }
+  for (const key of KNOWN_DSH_KEYS) {
+    if (dsh[key] !== undefined && typeof dsh[key] !== 'string') {
+      throw new Error(`foreman-config: harness.dsh.${key} in '${path}' must be a string`)
+    }
+  }
 }
 
 function validateCodex(codex, path) {

@@ -1,0 +1,100 @@
+{
+  "timestamp": "2026-08-26T22:54:52.836Z",
+  "node": "v24.1.0",
+  "codex": "codex-cli 0.150.0",
+  "workload": {
+    "turns": 3,
+    "payloadMb": 2,
+    "seedMb": 1,
+    "modelDelayMs": 300,
+    "measuredRuns": 1
+  },
+  "serial": {
+    "runMs": 5361,
+    "executionMs": 3532,
+    "prepareMs": 223,
+    "collectMs": 200,
+    "publishMs": 812,
+    "packagingMs": 454,
+    "checkpointSyncMs": 291,
+    "packSyncMs": 718
+  },
+  "overlap": {
+    "runMs": 5608,
+    "executionMs": 3858,
+    "prepareMs": 229,
+    "collectMs": 252,
+    "publishMs": 720,
+    "packagingMs": 658,
+    "checkpointSyncMs": 490,
+    "packSyncMs": 1303
+  },
+  "model": {
+    "projectedSavingMs": 291,
+    "observedSavingMs": -247
+  },
+  "runs": [
+    {
+      "mode": "serial",
+      "runMs": 5361,
+      "turnMs": [
+        1215,
+        1154,
+        1163
+      ],
+      "packSyncs": [
+        {
+          "turn": 2,
+          "from": 1,
+          "ms": 206
+        },
+        {
+          "turn": 3,
+          "from": 2,
+          "ms": 224
+        },
+        {
+          "turn": 1,
+          "from": null,
+          "ms": 288
+        }
+      ],
+      "prepareMs": 223,
+      "collectMs": 200,
+      "publishMs": 812,
+      "packagingMs": 454,
+      "checkpointSyncMs": 291
+    },
+    {
+      "mode": "overlap",
+      "runMs": 5608,
+      "turnMs": [
+        1247,
+        1257,
+        1354
+      ],
+      "packSyncs": [
+        {
+          "turn": 2,
+          "from": 1,
+          "ms": 411
+        },
+        {
+          "turn": 3,
+          "from": 2,
+          "ms": 405
+        },
+        {
+          "turn": 1,
+          "from": null,
+          "ms": 487
+        }
+      ],
+      "prepareMs": 229,
+      "collectMs": 252,
+      "publishMs": 720,
+      "packagingMs": 658,
+      "checkpointSyncMs": 490
+    }
+  ]
+}

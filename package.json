@@ -22,7 +22,9 @@
     "test:e2e:cloud": "node test/e2e/cloud.e2e.js",
     "test:e2e:web": "node test/e2e/web.e2e.js",
     "test:e2e:checkpoint": "node test/e2e/checkpoint.e2e.js",
-    "test:e2e:codex": "node test/e2e/codex.e2e.js"
+    "test:e2e:checkpoint:codex": "node test/e2e/checkpoint-chain.e2e.js",
+    "test:e2e:codex": "node test/e2e/codex.e2e.js",
+    "test:e2e:config": "node test/e2e/config-channel.e2e.js"
   },
   "keywords": [
     "agent",

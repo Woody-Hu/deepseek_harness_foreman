@@ -29,11 +29,12 @@
  * the crash-repair synthetic tool outcome.
  *
  * Usage: node test/e2e/web.e2e.js [--keep] (any cwd; --keep preserves the run
- * directory). Requires the dsh repository build (`pnpm run build`: the web
- * frontend dist).
+ * directory). Requires the dsh npm distribution on PATH (ADR-0012; see README
+ * "Prerequisites"); skips when the binary is absent.
  */
 import { createHash } from 'node:crypto'
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { execFile } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Foreman } from '../../src/foreman.js'
@@ -43,8 +44,17 @@ import { startMockControlPlane } from '../mocks/control-plane.js'
 import { startMockModel } from '../mocks/model.js'
 import { startMockOtlpCollector } from '../mocks/otlp.js'
 
-const repoRoot = new URL('../../../../', import.meta.url).pathname
+const repoDir = new URL('../../', import.meta.url).pathname
 const keep = process.argv.includes('--keep')
+
+// Skip when the dsh distribution binary is unavailable (ADR-0012)
+const dshAvailable = await new Promise((resolve) => {
+  execFile('dsh', ['--version'], (error) => { resolve(error?.code !== 'ENOENT') })
+})
+if (!dshAvailable) {
+  console.log('SKIP: dsh not found on PATH (install: npm install -g @deepseek-ai/dsh — see README Prerequisites)')
+  process.exit(0)
+}
 
 const t0 = Date.now()
 const log = (...args) => { console.log(`[+${((Date.now() - t0) / 1000).toFixed(1)}s]`, ...args) }
@@ -131,14 +141,13 @@ await writeFile(join(seedDir, 'README.md'), '# web e2e workspace\n\nrestored fro
 await writeFile(join(seedDir, '.env'), 'API_KEY=sk-web-seed-secret-31aa\n') // must be excluded from packaging
 const seedArchive = join(base, 'seed.tar.gz')
 await archiveDirectory(seedDir, seedArchive)
-await uploadArtifact(controlPlane, agentId, `${sessionId}/web-patch.yml`, await readFile(join(repoRoot, 'foreman/solution/web-patch.yml')))
+await uploadArtifact(controlPlane, agentId, `${sessionId}/web-patch.yml`, await readFile(join(repoDir, 'web-patch.yml')))
 await uploadArtifact(controlPlane, agentId, `${sessionId}/workspace.tar.gz`, await readFile(seedArchive))
 log('object storage seeded (web-patch.yml + workspace.tar.gz containing .env)')
 
 /** Build a web-channel foreman (shared options; the model endpoint and telemetry differ per run). */
 function makeForeman(modelPort, otlp) {
   return new Foreman({
-    repoRoot,
     workdir: sandboxDir,
     channel: 'web', // the web primary channel (apiproxy HTTP+WS + native HITL/resume)
     agentId,
@@ -150,7 +159,7 @@ function makeForeman(modelPort, otlp) {
     controlPlane,
     telemetry: otlp,
     secretValues: [ENV_SECRET],
-    pluginsDir: join(repoRoot, 'foreman/solution/plugins'), // telemetry-enrich (the generalized attribute pipeline engine)
+    pluginsDir: join(repoDir, 'plugins'), // telemetry-enrich (the generalized attribute pipeline engine)
     envExtra: {
       FOREMAN_TENANT_ID: TENANT_ID,
       FOREMAN_W3C_TRACE_ID: W3C_TRACE_ID,

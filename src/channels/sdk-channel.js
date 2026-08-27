@@ -1,5 +1,7 @@
 /**
- * SDK channel driver: launches dsh over stdio NDJSON JSON-RPC (jsonrpc-demo bin).
+ * SDK channel driver: launches the dsh JSON-RPC runtime over stdio NDJSON
+ * (`dsh-jsonrpc-agent` bin of the @deepseek-ai/dsh-sdk-jsonrpc-demo npm
+ * distribution — ADR-0012; no source checkout involved).
  *
  * Implements the rpcId request/response pairing of the SDK protocol. Channel
  * interface (mirrored by web-channel.js, consumed by foreman.js):
@@ -7,7 +9,7 @@
  *   shutdown() -> exitCode; sessionRoot -> session log root directory
  */
 import { spawn } from 'node:child_process'
-import { join } from 'node:path'
+import { dirname } from 'node:path'
 
 /** stdio NDJSON JSON-RPC 2.0 client. */
 class JsonRpcClient {
@@ -57,8 +59,7 @@ class JsonRpcClient {
 
 /**
  * @param {object} options
- * @param {string} options.repoRoot dsh repository root (cwd of the tsx source launch)
- * @param {string} options.configPath absolute path of cordis.yml
+ * @param {string} options.configPath absolute path of cordis.yml (the child's cwd is its directory)
  * @param {string} options.workspaceDir session workspace (absolute; must be identical across runs)
  * @param {string} options.sessionRoot session log root (DSH_SESSION_ROOT)
  * @param {object} options.modelEnv { DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL }
@@ -66,6 +67,7 @@ class JsonRpcClient {
  * @param {object} [options.envExtra] extra env injected into the dsh child process (tenant/trace ids — same non-persisted channel as secrets)
  * @param {string} [options.provider] initialize parameter (default deepseek-official)
  * @param {string} [options.model] initialize parameter (default deepseek-v4-pro)
+ * @param {string} [options.command] harness binary override (default 'dsh-jsonrpc-agent' from PATH — ADR-0012)
  */
 export class SdkChannel {
   constructor(options) {
@@ -79,13 +81,12 @@ export class SdkChannel {
   /** Launch the dsh child process and complete the initialize handshake. handlers: { onEvent, onStatus } */
   async start(handlers) {
     const t0 = Date.now()
-    const { repoRoot, configPath, workspaceDir, sessionRoot, modelEnv, telemetry } = this.options
-    this.child = spawn(process.execPath, [
-      '--import', 'tsx',
-      join(repoRoot, 'packages/examples/jsonrpc-demo/src/bin.ts'),
-      configPath,
-    ], {
-      cwd: repoRoot,
+    const { configPath, workspaceDir, sessionRoot, modelEnv, telemetry } = this.options
+    this.child = spawn(this.options.command ?? 'dsh-jsonrpc-agent', [configPath], {
+      // The child's cwd is the config directory: `./plugins/*.mjs` relative
+      // plugin references in cordis.yml resolve against the config location
+      // (the runner materializes them there).
+      cwd: dirname(configPath),
       // Secrets exist only in the child process environment (memory), never in files
       env: {
         ...process.env,

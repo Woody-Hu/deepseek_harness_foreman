@@ -29,16 +29,22 @@ without a test.
 - `publish()` — redact, package (compress), upload the workspace snapshot, emit the
   sandbox-reclaimable notification.
 
-### Overlap scheduling (ADR-0010)
+### Overlap scheduling (ADR-0011)
 
-- Per-turn background checkpoint sync: each turn's pack is built and uploaded while the
-  next turn executes; `publish()` drains the chain before the retention sync (no reclaim
-  with a sync in flight; the index is written only after the drain).
-- Concurrent transfers: workspace packs and the session archive download in parallel
-  during `prepare()`; the publish artifact batch uploads in parallel.
+- Session-boundary overlap: `prepare()` downloads independent objects (session
+  archive + workspace packs/seed) concurrently; `publish()` runs one concurrent
+  fan-out — artifact packaging, checkpoint pack builds/uploads, and the
+  artifact upload batch overlap (pack content comes from immutable git
+  commits, so concurrency cannot tear a pack). The checkpoint index is written
+  only after every pack upload in the same sync completed.
+- `checkpoints.overlap` (default `true`) selects concurrent vs serialized
+  publish (the benchmark's A/B baseline); the per-turn background sync chain of
+  ADR-0010 3a was removed as disproportionate complexity (superseded by
+  ADR-0011).
 - Measured (`bench/run-pipeline.bench.js`, real codex channel, 5 turns × 8 MiB):
-  2 065 ms saved per run (12.1% sandbox occupancy), 85% of the critical-path
-  projection — see ADR-0010's verification section.
+  publish 3 150 → 2 828 ms (concurrent phases inflate under CPU contention; the
+  contention-aware projection `(K+ΣC)−max(K′,ΣC′)` matches the observed saving) —
+  see ADR-0011's verification section.
 
 ### Channels
 
@@ -99,16 +105,23 @@ Canonical ids per ADR-0009 (legacy aliases `stdio` / `web` accepted):
 - **E2E scenarios** — basic resume, web HITL + crash recovery, cloud (trace/sink/bus/
   adaptation), 7-round checkpoint chain, codex channel (cold start + cross-sandbox
   `thread/resume` + tool execution + checkpoint restore, driven by the real codex binary
-  against a scripted Responses-API endpoint; skips when the binary is absent).
+  against a scripted Responses-API endpoint; skips when the binary is absent),
+  config-only channel selection (codex full run + dsh-sdk/dsh-web resolution, entirely
+  from `foreman.config.json`), checkpoint-chain stress on the codex channel (retention
+  drops / anchor-drift rebuilds / rebase / bit-for-bit restore under the concurrent
+  publish fan-out). The dsh scenarios additionally require the harness repository
+  checkout one level above this one.
 - **Protocol pipeline benchmark** (`npm run bench`) — formatter-only throughput plus
   end-to-end throughput/latency (p50/p95/p99) per protocol over real loopback HTTP, driven
   by the same golden transcripts; results written to `bench/results/`. Integrity gate: the
   benchmark refuses to report numbers unless every emitted event is received (no benchmarking
   a broken pipeline, no derived numbers).
-- **Run-pipeline benchmark** (`npm run bench:pipeline`, ADR-0010) — A/B overlap on/off on
-  the real codex channel with real git/tar/uploads and a scripted model latency; integrity
-  gates: payload presence, pack-sync phase placement, and bit-for-bit restore from the
-  published index; verifies the critical-path performance model against the observed
+- **Run-pipeline benchmark** (`npm run bench:pipeline`, ADR-0011) — A/B session-end
+  overlap on/off on the real codex channel with real git/tar/uploads and a scripted
+  model latency; integrity gates: payload presence, a publish-phase concurrency check
+  (the overlap mode's publish wall time must be below the sum of its concurrent
+  phases), and bit-for-bit restore from the published index; verifies the
+  critical-path model (`publish_overlap ≈ max(K, ΣC) + U`) against the observed
   saving.
 
 Reference figures (this sandbox, `--quick`, median of 3 runs — indicative, not a contract):
@@ -121,9 +134,9 @@ Reference figures (this sandbox, `--quick`, median of 3 runs — indicative, not
 
 ### Documentation
 
-- ADRs 0001–0010 (adapter layer, config file, codex dialect, hermetic testing, Codex channel,
+- ADRs 0001–0011 (adapter layer, config file, codex dialect, hermetic testing, Codex channel,
   Anthropic Messages, inbound adaptation, harness protocol testing, channel naming, overlap
-  scheduling).
+  scheduling, session-boundary overlap).
 - Design docs: SSE protocol adapter, Codex channel, Anthropic Messages protocol.
 - Architecture + checkpoint design docs; this roadmap.
 
@@ -145,10 +158,11 @@ Deliberate limits of the current implementation; each maps to a roadmap item bel
    dialects are not yet covered.
 4. **SSE gateway is single-node, in-memory.** Replay buffer lives in the process; a gateway
    restart loses resumability (events are still durable via trace/event-bus paths).
-5. **Overlap scheduling is single-session only.** Overlaps happen within one run's
-   lifecycle (pack sync during execution, concurrent transfers). There is no
-   cross-session scheduler yet — no pre-restoring sandbox B's workspace while sandbox A
-   executes (revisit when sandboxes are pooled; ADR-0010 option 2).
+5. **Overlap scheduling is single-session only.** Overlaps happen at the session
+   boundaries (concurrent prepare downloads; concurrent publish fan-out). There is
+   no cross-session scheduler yet — no pre-restoring sandbox B's workspace while
+   sandbox A executes (revisit when sandboxes are pooled; ADR-0010 option 2 /
+   ADR-0011).
 6. **Adapters are output-only modules.** There is no inbound parser (wire → internal frame);
    a "full duplex" protocol adapter (needed for a transparent proxy mode) does not exist.
    ADR-0007 proposes the generalized parse direction.
@@ -184,10 +198,24 @@ Deliberate limits of the current implementation; each maps to a roadmap item bel
 - [x] **Harness-scoped channel naming** (ADR-0009) — `dsh-sdk` / `dsh-web` / `codex`
       canonical ids; legacy `stdio` / `web` aliases accepted; config surface validated
       against the canonical list.
-- [x] **Overlap scheduling** (ADR-0010) — per-turn background checkpoint sync + concurrent
-      prepare/publish transfers; measured on the real codex channel (5 turns × 8 MiB):
-      2 065 ms saved per run (12.1% sandbox occupancy), 85% of the projected critical-path
-      saving — `bench/run-pipeline.bench.js`.
+- [x] **Overlap scheduling** (ADR-0010, mechanism 3a since superseded by ADR-0011) —
+      concurrent prepare/publish transfers, originally with per-turn background
+      checkpoint sync; measured on the real codex channel (5 turns × 8 MiB):
+      2 065 ms saved per run (12.1% sandbox occupancy), 85% of the projected
+      critical-path saving — `bench/run-pipeline.bench.js`.
+- [x] **Session-boundary overlap** (ADR-0011) — the per-turn background sync chain
+      was removed (disproportionate complexity); publish is now one concurrent
+      fan-out (packaging ∥ checkpoint pack builds/uploads ∥ artifact uploads);
+      benchmark reworked with a publish-concurrency integrity gate and the
+      `min(K, ΣC)` critical-path model.
+- [x] **Config-only channel switching acceptance** — `test/e2e/config-channel.e2e.js`:
+      the codex channel runs end to end (real binary) with the channel and model
+      wiring coming entirely from `foreman.config.json`; dsh-sdk/dsh-web resolve
+      from config alone (full dsh start still requires the harness repo checkout).
+- [x] **Checkpoint-chain stress on the codex channel** —
+      `test/e2e/checkpoint-chain.e2e.js`: retention drops / anchor-drift rebuilds /
+      rebase / bit-for-bit restore across 4 rounds under the concurrent publish
+      fan-out (companion of the dsh-repo-based checkpoint e2e).
 - [x] **`anthropic-messages` adapter** (ADR-0006) — registered adapter, golden-transcript
       conformance tests, wire-level tests, and benchmark integration
       (`src/events/protocols/anthropic-messages.js`).
@@ -259,4 +287,4 @@ Deliberate limits of the current implementation; each maps to a roadmap item bel
 
 ---
 
-*Last updated: 2026-08-26*
+*Last updated: 2026-08-27*

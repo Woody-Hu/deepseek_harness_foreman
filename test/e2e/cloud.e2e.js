@@ -19,11 +19,12 @@
  *      (clean) + leak.txt (secret-looking) -> turn-commit secret interception
  *      (leak.txt stays out of commits/history) + the authoritative change set.
  *
- * Prerequisite: `pnpm run build` (the web frontend dist). Usage: node
- * test/e2e/cloud.e2e.js
+ * Prerequisite: the dsh npm distribution on PATH (ADR-0012; see README
+ * "Prerequisites"). Usage: node test/e2e/cloud.e2e.js
  */
 import { createServer } from 'node:http'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { execFile } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Foreman } from '../../src/foreman.js'
@@ -33,8 +34,17 @@ import { uploadArtifact } from '../../src/control-plane.js'
 import { parseOtlpLogs } from '../mocks/otlp.js'
 import { archiveDirectory } from '../../src/core/workspace.js'
 
-const repoRoot = new URL('../../../../', import.meta.url).pathname.replace(/\/$/, '')
+const repoDir = new URL('../../', import.meta.url).pathname
 const t0 = Date.now()
+
+// Skip when the dsh distribution binary is unavailable (ADR-0012)
+const dshAvailable = await new Promise((resolve) => {
+  execFile('dsh', ['--version'], (error) => { resolve(error?.code !== 'ENOENT') })
+})
+if (!dshAvailable) {
+  console.log('SKIP: dsh not found on PATH (install: npm install -g @deepseek-ai/dsh — see README Prerequisites)')
+  process.exit(0)
+}
 const log = (...args) => { console.log(`[+${((Date.now() - t0) / 1000).toFixed(1)}s]`, ...args) }
 
 const results = []
@@ -183,7 +193,7 @@ await mkdir(seedDir, { recursive: true })
 await writeFile(join(seedDir, 'README.md'), '# cloud e2e workspace\n\nrestored from object storage.\n')
 const seedArchive = join(base, 'seed.tar.gz')
 await archiveDirectory(seedDir, seedArchive)
-await uploadArtifact(controlPlane, agentId, `${sessionId}/web-patch.yml`, await readFile(join(repoRoot, 'foreman/solution/web-patch.yml')))
+await uploadArtifact(controlPlane, agentId, `${sessionId}/web-patch.yml`, await readFile(join(repoDir, 'web-patch.yml')))
 await uploadArtifact(controlPlane, agentId, `${sessionId}/workspace.tar.gz`, await readFile(seedArchive))
 
 // Dynamic credentials (injected by the cloud per task; the snapshot token
@@ -192,7 +202,6 @@ process.env.FOREMAN_SNAPSHOT_TOKEN = 'snap-token-A'
 process.env.FOREMAN_BUS_TOKEN = 'bus-token-cloud'
 
 const foreman = new Foreman({
-  repoRoot,
   workdir: sandboxDir,
   channel: 'web',
   agentId,
@@ -201,7 +210,7 @@ const foreman = new Foreman({
   controlPlane,
   telemetry: { mode: 'FULL', otlpUrl: monitoring.url }, // taken over by the shipper (local receiver)
   secretValues: [ENV_SECRET],
-  pluginsDir: join(repoRoot, 'foreman/solution/plugins'),
+  pluginsDir: join(repoDir, 'plugins'),
   envExtra: { FOREMAN_TENANT_ID: 'tenant-cloud', FOREMAN_RUN_CONTEXT: JSON.stringify({ costCenter: 'cc-1' }) },
   // 1. Async trace shipping (cloud-monitoring failures never affect the main flow; flush delivers after recovery)
   traceShipper: { upstreamUrl: monitoring.url, retries: 8, retryBaseMs: 50 },
