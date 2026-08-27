@@ -68,13 +68,13 @@ const PAYLOAD_BYTES = PAYLOAD_MB * 1024 * 1024
 const t0 = Date.now()
 const log = (...args) => { console.log(`[+${((Date.now() - t0) / 1000).toFixed(1)}s]`, ...args) }
 
-// ---- Skip when the codex binary is unavailable ----
+// ---- The codex binary is a hard prerequisite — never a skip ----
 const codexVersion = await new Promise((resolve) => {
   execFile('codex', ['--version'], (error, stdout) => { resolve(error === null ? stdout.trim() : null) })
 })
 if (codexVersion === null) {
-  console.log('SKIP: codex binary not found on PATH (install: npm install -g @openai/codex)')
-  process.exit(0)
+  console.error('FATAL: codex binary not found on PATH — this benchmark requires the real harness (install: npm install -g @openai/codex)')
+  process.exit(1)
 }
 
 /** Fail-loud gate helper. */

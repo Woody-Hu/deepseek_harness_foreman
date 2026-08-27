@@ -33,18 +33,13 @@ import { startMockControlPlane } from '../mocks/control-plane.js'
 import { uploadArtifact } from '../../src/control-plane.js'
 import { parseOtlpLogs } from '../mocks/otlp.js'
 import { archiveDirectory } from '../../src/core/workspace.js'
+import { requireBinary } from '../require-bin.js'
 
 const repoDir = new URL('../../', import.meta.url).pathname
 const t0 = Date.now()
 
-// Skip when the dsh distribution binary is unavailable (ADR-0012)
-const dshAvailable = await new Promise((resolve) => {
-  execFile('dsh', ['--version'], (error) => { resolve(error?.code !== 'ENOENT') })
-})
-if (!dshAvailable) {
-  console.log('SKIP: dsh not found on PATH (install: npm install -g @deepseek-ai/dsh — see README Prerequisites)')
-  process.exit(0)
-}
+// The dsh distribution binary is a hard prerequisite (ADR-0012) — never a skip
+await requireBinary('dsh', ['--version'], 'npm install -g @deepseek-ai/dsh (see README Prerequisites)')
 const log = (...args) => { console.log(`[+${((Date.now() - t0) / 1000).toFixed(1)}s]`, ...args) }
 
 const results = []
@@ -272,9 +267,9 @@ assert('records delivered to cloud monitoring carry tenant attributes (the attri
 assert('cloud monitoring received records only after the turn ended (async: main flow first)',
   monitoring.records.length > 0 && monitoring.requestCount() > 0)
 
-const artifactNames = ['result.json', 'workspace.tar.gz', 'sessions.tar.gz', 'trace.jsonl']
-assert('snapshot sink: 4 artifacts uploaded via object storage (rotated Bearer credential accepted)',
-  objectStore.uploads.length === 4 && objectStore.uploads.every((upload) => upload.token === 'snap-token-B'),
+const artifactNames = ['result.json', 'workspace.tar.gz', 'sessions.tar.gz', 'trace.jsonl', 'profile.json']
+assert('snapshot sink: 5 artifacts uploaded via object storage (rotated Bearer credential accepted)',
+  objectStore.uploads.length === 5 && objectStore.uploads.every((upload) => upload.token === 'snap-token-B'),
   objectStore.uploads.map((upload) => `${upload.key.split('/').at(-1)}@${upload.token}`).join(', '))
 assert('snapshot sink upload keys = <agentId>/<sessionId>/<artifact>', objectStore.uploads.every(
   (upload) => upload.key.startsWith(`/${agentId}/${sessionId}/`)))

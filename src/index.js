@@ -22,4 +22,5 @@ export { registerProtocol, resolveProtocol, listProtocols } from './events/proto
 export { loadForemanConfig, resolveConfigPath } from './config.js'
 export { createEventBus } from './events/event-bus.js'
 export { TraceShipper } from './observability/trace-shipper.js'
+export { RunProfiler } from './observability/profiler.js'
 export { createSnapshotSink } from './storage/snapshot-sink.js'

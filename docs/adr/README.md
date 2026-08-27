@@ -19,6 +19,7 @@ edited in place after acceptance.
 | [0010](0010-overlap-scheduling.md) | Overlap scheduling for run-lifecycle I/O | Accepted (3a superseded by ADR-0011) |
 | [0011](0011-session-boundary-overlap-scheduling.md) | Session-boundary overlap scheduling | Accepted |
 | [0012](0012-dsh-distribution-launch.md) | dsh channels launch from the npm distribution | Accepted |
+| [0013](0013-run-profiling-and-throughput-model.md) | Run profiling and the task-throughput performance model | Accepted |
 
 ## Process
 

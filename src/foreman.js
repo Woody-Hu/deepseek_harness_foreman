@@ -69,6 +69,7 @@ import { CodexChannel } from './channels/codex-channel.js'
 import { createEventFormatter, renderSseLine } from './events/formats.js'
 import { loadForemanConfig, resolveChannelId, resolveConfigPath } from './config.js'
 import { TraceShipper } from './observability/trace-shipper.js'
+import { RunProfiler } from './observability/profiler.js'
 import { createSnapshotSink } from './storage/snapshot-sink.js'
 import { createEventBus } from './events/event-bus.js'
 import { GitWorkspace } from './core/git-workspace.js'
@@ -257,6 +258,10 @@ export class Foreman {
     this.traceFrames = []
     this.phase = 'constructed'
     this.timings = {}
+    // Span-based profiling (ADR-0013): always on, additive to `timings`
+    // (the compatibility surface); the analysis surface is the report
+    // (profile.json artifact + result.json's `profiling` section)
+    this.profiler = new RunProfiler({ sessionId: options.sessionId, agentId: options.agentId })
     this.pendingApprovals = new Map() // approvalId -> { rpcId, frame } (web channel HITL)
     this.external = {} // results/stats of external wiring like shipper/bus/git/checkpoints (merged into publish result)
     this.promptTurns = 0 // turns completed (and committed) this run
@@ -292,6 +297,7 @@ export class Foreman {
   async #resolveChannel() {
     const config = await this.#ensureConfig()
     this.channelId = resolveChannelId(this.options.channel ?? config.harness?.channel ?? 'dsh-sdk')
+    this.profiler.meta.channel = this.channelId
     // dsh harness binaries (ADR-0012): constructor option > config file > PATH defaults
     this.dshOptions = { ...config.harness?.dsh, ...this.options.dsh }
     return this.channelId
@@ -308,7 +314,8 @@ export class Foreman {
     // composition; its model wiring lives in CODEX_HOME/config.toml).
     if (this.channelId !== 'codex') {
       const configKey = this.isWeb ? `${sessionId}/web-patch.yml` : `${sessionId}/cordis.yml`
-      const configBuffer = await downloadArtifact(controlPlane, agentId, configKey)
+      const configBuffer = await this.profiler.span('prepare.config.download', () =>
+        downloadArtifact(controlPlane, agentId, configKey))
       this.configPath = join(this.options.workdir, this.isWeb ? 'web-patch.yml' : 'cordis.yml')
       await writeFile(this.configPath, configBuffer)
 
@@ -332,7 +339,8 @@ export class Foreman {
     // mapping restored with it) continues the history — cross-sandbox session
     // resume. Note: resume requires the workspace's absolute path to match
     // the previous round (cloud sandboxes use fixed mount points).
-    const sessionsDownload = downloadArtifact(controlPlane, agentId, `${sessionId}/sessions.tar.gz`)
+    const sessionsDownload = this.profiler.span('prepare.sessions.download', () =>
+      downloadArtifact(controlPlane, agentId, `${sessionId}/sessions.tar.gz`))
       .then((buffer) => ({ buffer }))
       .catch(() => ({ buffer: null })) // first round: no session logs in object storage yet
 
@@ -354,16 +362,19 @@ export class Foreman {
       await mkdir(this.workspaceDir, { recursive: true })
     } else {
       const workspaceBundle = join(this.options.workdir, 'seed-workspace.tar.gz')
-      const seedBuffer = await downloadArtifact(controlPlane, agentId, `${sessionId}/workspace.tar.gz`)
+      const seedBuffer = await this.profiler.span('prepare.workspace.download', () =>
+        downloadArtifact(controlPlane, agentId, `${sessionId}/workspace.tar.gz`))
       await writeFile(workspaceBundle, seedBuffer)
-      await extractArchive(workspaceBundle, this.workspaceDir)
+      await this.profiler.span('prepare.workspace.extract', () =>
+        extractArchive(workspaceBundle, this.workspaceDir))
     }
 
     const { buffer: sessionsBuffer } = await sessionsDownload
     if (sessionsBuffer !== null) {
       const sessionsBundle = join(this.options.workdir, 'seed-sessions.tar.gz')
       await writeFile(sessionsBundle, sessionsBuffer)
-      await extractArchive(sessionsBundle, this.sessionRoot)
+      await this.profiler.span('prepare.sessions.extract', () =>
+        extractArchive(sessionsBundle, this.sessionRoot))
     }
 
     this.baselineManifest = await fileManifest(this.workspaceDir)
@@ -391,29 +402,31 @@ export class Foreman {
           index: ckptIndex,
         }
         const restored = []
-        // Packs download concurrently (independent objects — ADR-0010 3b) and
-        // apply sequentially (the git replay chain is ordered)
-        const packBuffers = await Promise.all(
-          ckptIndex.packs.map((pack) => downloadArtifact(controlPlane, agentId, `${sessionId}/${pack.object}`)),
-        )
-        for (const [position, pack] of ckptIndex.packs.entries()) {
-          const archiveFile = join(this.options.workdir, `restore-${pack.turn}.tar.gz`)
-          await writeFile(archiveFile, packBuffers[position])
-          const packDir = join(this.options.workdir, `restore-${pack.turn}`)
-          await extractChangePack(archiveFile, packDir)
-          const applied = await applyChangePack(this.git, packDir, `foreman: checkpoint ${pack.turn} (replayed)`)
-          const oid = applied.oid ?? await this.git.headOid() // an empty change pack lands on the current HEAD
-          this.ckpt.oids.set(pack.turn, oid === '' ? undefined : oid)
-          this.ckpt.turn = pack.turn
-          restored.push(pack.turn)
-        }
+        await this.profiler.span('prepare.checkpoint.restore', async () => {
+          // Packs download concurrently (independent objects — ADR-0010 3b) and
+          // apply sequentially (the git replay chain is ordered)
+          const packBuffers = await Promise.all(
+            ckptIndex.packs.map((pack) => downloadArtifact(controlPlane, agentId, `${sessionId}/${pack.object}`)),
+          )
+          for (const [position, pack] of ckptIndex.packs.entries()) {
+            const archiveFile = join(this.options.workdir, `restore-${pack.turn}.tar.gz`)
+            await writeFile(archiveFile, packBuffers[position])
+            const packDir = join(this.options.workdir, `restore-${pack.turn}`)
+            await extractChangePack(archiveFile, packDir)
+            const applied = await applyChangePack(this.git, packDir, `foreman: checkpoint ${pack.turn} (replayed)`)
+            const oid = applied.oid ?? await this.git.headOid() // an empty change pack lands on the current HEAD
+            this.ckpt.oids.set(pack.turn, oid === '' ? undefined : oid)
+            this.ckpt.turn = pack.turn
+            restored.push(pack.turn)
+          }
+        })
         this.git.baselineOid = this.ckpt.oids.get(this.ckpt.turn)
         this.external.gitBaseline = {
           restoredCheckpoints: restored,
           restoredToTurn: this.ckpt.turn,
         }
       } else {
-        const baseline = await this.git.commitBaseline()
+        const baseline = await this.profiler.span('prepare.git.baseline', () => this.git.commitBaseline())
         this.external.gitBaseline = { oid: baseline.oid, files: baseline.files.length, violations: baseline.violations }
         if (this.options.checkpoints !== undefined) {
           this.ckpt = {
@@ -437,7 +450,8 @@ export class Foreman {
     // Trace shipper: dsh's OTLP is repointed at the local receiver; cloud
     // forwarding is isolated asynchronously.
     if (this.options.traceShipper !== undefined) {
-      this.shipper = await new TraceShipper(this.options.traceShipper).start()
+      this.shipper = await this.profiler.span('start.shipper', async () =>
+        new TraceShipper(this.options.traceShipper).start())
       this.telemetryForChannel = { ...telemetry, otlpUrl: this.shipper.endpoint }
     } else {
       this.telemetryForChannel = telemetry
@@ -457,10 +471,11 @@ export class Foreman {
       bus: this.bus,
       delivery: events.delivery ?? 'sse',
     })
-    this.ssePort = await this.gateway.listen()
+    this.ssePort = await this.profiler.span('start.gateway', () => this.gateway.listen())
 
     const onEvent = (sessionId, event) => {
       this.events.push(event)
+      this.profiler.noteEvent(event.type) // stream counters + per-turn attribution (ADR-0013)
       const frame = {
         kind: 'session.event',
         sessionId,
@@ -508,11 +523,11 @@ export class Foreman {
           outcome: resolved.outcome,
         })
       }
-      const info = await this.channel.start({
+      const info = await this.profiler.span('start.channel', () => this.channel.start({
         onEvent,
         onApproval: handleApproval,
         onApprovalResolved: handleApprovalResolved,
-      })
+      }))
       // External systems answer through the gateway's POST /hitl:
       // {sessionId, approvalId, outcome} -> /api/respond
       this.gateway.setHitlHandler(async ({ approvalId, outcome }) => {
@@ -552,7 +567,7 @@ export class Foreman {
         envExtra: this.options.envExtra,
         ...(this.options.codex ?? {}), // constructor-level overrides (incl. apiKey — env-injected only)
       })
-      const init = await this.channel.start({ onEvent, onStatus })
+      const init = await this.profiler.span('start.channel', () => this.channel.start({ onEvent, onStatus }))
       this.phase = 'running'
       this.timings.bootMs = this.channel.timings.bootMs
       this.gateway.publish({ kind: 'foreman.phase', phase: 'running', sessionId: this.options.sessionId, channel: 'codex', threadId: init.threadId, resumed: init.resumed === true })
@@ -570,7 +585,7 @@ export class Foreman {
       provider: this.options.provider,
       model: this.options.model,
     })
-    const init = await this.channel.start({ onEvent, onStatus })
+    const init = await this.profiler.span('start.channel', () => this.channel.start({ onEvent, onStatus }))
     this.phase = 'running'
     this.timings.bootMs = this.channel.timings.bootMs
     this.gateway.publish({ kind: 'foreman.phase', phase: 'running', sessionId: this.options.sessionId, channel: 'dsh-sdk' })
@@ -584,16 +599,26 @@ export class Foreman {
    */
   async prompt(text, { timeoutMs = 120_000 } = {}) {
     const t0 = Date.now()
-    const result = await this.channel.prompt(this.options.sessionId, text, { timeoutMs })
+    // Profiling (ADR-0013): per-turn record — execute span, commit span,
+    // first-event latency, per-turn event count
+    const turnNumber = (this.ckpt !== undefined ? this.ckpt.turn : this.promptTurns) + 1
+    const turnRecord = this.profiler.beginTurn(turnNumber)
+    const result = await this.profiler.span(`turn.${turnNumber}.execute`, () =>
+      this.channel.prompt(this.options.sessionId, text, { timeoutMs }))
+    this.profiler.endTurn(turnRecord, { executeMs: Date.now() - t0 })
     this.lastTurnEndReason = result.reason
     this.timings.turnMs = Date.now() - t0
     this.promptTurns += 1
     if (this.ckpt !== undefined) {
       const t1 = Date.now()
       this.ckpt.turn += 1
-      const turn = await this.git.commitTurn(`#${this.ckpt.turn}`)
-      const oid = turn.oid ?? await this.git.headOid()
-      this.ckpt.oids.set(this.ckpt.turn, oid === '' ? undefined : oid)
+      const turn = await this.profiler.span(`turn.${turnNumber}.commit`, async () => {
+        const committed = await this.git.commitTurn(`#${this.ckpt.turn}`)
+        const oid = committed.oid ?? await this.git.headOid()
+        this.ckpt.oids.set(this.ckpt.turn, oid === '' ? undefined : oid)
+        return committed
+      })
+      turnRecord.commitMs = Date.now() - t1
       this.lastTurnCommit = turn
       this.timings.turnCommitMs = Date.now() - t1
     }
@@ -625,6 +650,7 @@ export class Foreman {
 
   /** Collect products: the final answer / session logs / manifest change set / fs diffs. */
   async collect() {
+    return await this.profiler.span('collect', async () => {
     const assistants = this.events.filter((event) => event.type === 'assistant/message')
     const final = assistants[assistants.length - 1]
     const textBlocks = (final?.data.message.content ?? []).filter((block) => block.type === 'text')
@@ -676,6 +702,7 @@ export class Foreman {
       sessionLogFiles: this.sessionLogFiles,
       git: this.gitInfo,
     }
+    })
   }
 
   /**
@@ -707,14 +734,18 @@ export class Foreman {
     const packaging = async () => {
       const startedAt = Date.now()
       const [packaged] = await Promise.all([
-        packageWorkspace(this.workspaceDir, workspaceArchive, { secretValues }),
-        archiveDirectory(this.sessionRoot, sessionsArchive, { exclude: ['./.tmp'] }),
-        writeFile(tracePath, this.traceFrames.map((frame) => JSON.stringify(frame)).join('\n') + '\n'),
+        this.profiler.span('publish.packaging.workspace', () =>
+          packageWorkspace(this.workspaceDir, workspaceArchive, { secretValues })),
+        this.profiler.span('publish.packaging.sessions', () =>
+          archiveDirectory(this.sessionRoot, sessionsArchive, { exclude: ['./.tmp'] })),
+        this.profiler.span('publish.packaging.trace', () =>
+          writeFile(tracePath, this.traceFrames.map((frame) => JSON.stringify(frame)).join('\n') + '\n')),
       ])
       this.timings.packagingMs = Date.now() - startedAt
       return packaged
     }
-    const checkpointSync = () => (this.ckpt === undefined ? undefined : this.syncCheckpoints())
+    const checkpointSync = () => (this.ckpt === undefined ? undefined
+      : this.profiler.span('publish.checkpointSync', () => this.syncCheckpoints()))
 
     let packaged
     let checkpoints
@@ -739,6 +770,7 @@ export class Foreman {
       toolCalls: this.fsChanges.toolCalls.map((call) => call.name),
       eventCount: this.events.length,
       timings: this.timings,
+      profiling: this.profiler.derived(), // the throughput view so far (ADR-0013; full spans in profile.json)
       exitCode: this.exitCode,
       git: this.gitInfo, // baseline/turn commit oids, authoritative change set, secret interception violations
     }
@@ -764,9 +796,24 @@ export class Foreman {
       ['sessions.tar.gz', await readFile(sessionsArchive)],
       ['trace.jsonl', await readFile(tracePath)],
     ]
-    await Promise.all(uploads.map(async ([name, buffer]) => {
+    await this.profiler.span('publish.uploads', () => Promise.all(uploads.map(async ([name, buffer]) => {
       await uploadArtifact(controlPlane, agentId, `${sessionId}/${name}`, buffer)
-    }))
+      this.profiler.count('upload')
+    })))
+
+    // The run profile (ADR-0013): snapshot after the artifact batch so the
+    // spans cover prepare → uploads; the profile's own upload is the last
+    // artifact of the batch. Uploaded like every other artifact (and listed
+    // in the reclaim event) so the scheduler can consume it.
+    this.profiler.end()
+    const profilePath = join(this.artifactsDir, 'profile.json')
+    await writeFile(profilePath, JSON.stringify(this.profiler.report(), null, 2))
+    await this.profiler.span('publish.profileUpload', async () => {
+      await uploadArtifact(controlPlane, agentId, `${sessionId}/profile.json`, await readFile(profilePath))
+    })
+    this.profiler.count('upload')
+    uploads.push(['profile.json', await readFile(profilePath)])
+
     // Snapshot sink: when configured, the same batch of artifacts is sent
     // through the storage abstraction (credentials resolved dynamically from
     // env on each call)
@@ -778,20 +825,22 @@ export class Foreman {
       }))
     }
 
-    await publishBusEvent(controlPlane, {
-      type: 'run.completed',
-      agentId,
-      sessionId,
-      status: result.status,
-      changedFileCount: result.changedFiles.added.length + result.changedFiles.modified.length + result.changedFiles.removed.length,
-    })
-    // Let the system reclaim the sandbox: workspace and session are archived
-    // and asynchronous wiring is flushed — no unsaved state remains inside
-    await publishBusEvent(controlPlane, {
-      type: 'sandbox.reclaim-requested',
-      agentId,
-      sessionId,
-      artifacts: uploads.map(([name]) => `${sessionId}/${name}`),
+    await this.profiler.span('publish.bus', async () => {
+      await publishBusEvent(controlPlane, {
+        type: 'run.completed',
+        agentId,
+        sessionId,
+        status: result.status,
+        changedFileCount: result.changedFiles.added.length + result.changedFiles.modified.length + result.changedFiles.removed.length,
+      })
+      // Let the system reclaim the sandbox: workspace and session are archived
+      // and asynchronous wiring is flushed — no unsaved state remains inside
+      await publishBusEvent(controlPlane, {
+        type: 'sandbox.reclaim-requested',
+        agentId,
+        sessionId,
+        artifacts: uploads.map(([name]) => `${sessionId}/${name}`),
+      })
     })
     this.phase = 'published'
     this.timings.publishMs = Date.now() - t0
@@ -862,6 +911,7 @@ export class Foreman {
       })
       await uploadArtifact(controlPlane, agentId, `${sessionId}/${packKey(entry.turn)}`, await readFile(packPath))
       this.ckptSyncRecords.push({ turn: entry.turn, from: entry.from, ms: Date.now() - packStartedAt })
+      this.profiler.count('checkpoint.pack')
       stats[existing === undefined ? 'uploaded' : 'rebuilt'] += 1
     }
     const pending = []
@@ -883,6 +933,7 @@ export class Foreman {
       rebasedAt,
       packs: desired.map((entry) => ({ turn: entry.turn, from: entry.from, object: packKey(entry.turn) })),
     }
+    this.profiler.gauge('checkpoint.packs', ckpt.index.packs.length)
     await uploadArtifact(
       controlPlane, agentId, `${sessionId}/${INDEX_KEY}`,
       Buffer.from(JSON.stringify(ckpt.index, null, 2)),
